@@ -58,13 +58,6 @@ XiaoNZ Agent 是一个长期运行的个人 Agent。它：
 | Shell | `run_command`（带超时 + 输出截断） |
 | Skills | `list_skills` · `load_skill` · `install_skill` · `uninstall_skill` |
 
-### 工程细节
-
-- httpx 细分 timeout（connect 10s / read 60s）+ 单次重试，避免上游慢导致事件循环假死
-- SQLite 写入走 `asyncio.to_thread`，不阻塞主循环
-- Fire-and-forget 后台任务统一异常捕获 + 日志
-- `launchd` (macOS) / `systemd` (Linux) 友好的前台阻塞模式
-
 ---
 
 ## 快速开始
