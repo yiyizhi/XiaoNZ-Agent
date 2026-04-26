@@ -14,10 +14,53 @@ XiaoNZ Agent 是一个长期运行的个人 Agent。它：
 - 通过**飞书长连接**收发消息（无需公网 HTTPS 入口）
 - 把对话、长期记忆、人设全存在本地 **SQLite + Markdown 文件**里
 - 调用 **Claude Opus 4.7**（或任何 Anthropic Messages API 兼容端点）
-- 自带工具集：`update_memory` · `search_memory_semantic` · `web_fetch` · `generate_image` · `run_command` 等
 - 每天自动生成"昨日 digest"并写入向量库，让 Agent 能跨天回忆
 
-跟完整版 OpenClaw 的区别：**不分布式、不多租户、不容器化**——一台机器一个用户一个进程，简单粗暴，500 行代码能看完核心。
+跟完整版 OpenClaw 的区别：**不分布式、不多租户、不容器化**——一台机器一个用户一个进程，简单粗暴，核心代码 ~3k 行能看完。
+
+---
+
+## 已实现功能
+
+### 🧠 模型 & 对话
+- **Claude Opus 4.7 默认**，可在 config 里切到 Sonnet 4.6 / Haiku 4.5
+- 任何 Anthropic Messages API 兼容上游（官方 / 自建网关 / 代理）
+- Tool-use 主循环（最多 20 轮 / 每轮用户消息）
+- 自动会话压缩：history 超过阈值时把旧消息折叠成 summary
+- 取消机制：用户连发新消息会取消上一轮未完成的工具循环
+
+### 💬 飞书集成
+- lark-oapi 长连接客户端，无需公网入口
+- 单聊 + 群聊（@bot 触发）
+- 卡片消息：模型一边生成一边 patch 卡片（流式体验）
+- 接收消息 + 图片 + 文件附件（自动转 Markdown 注入上下文）
+- "我想想…" 思考中状态指示
+- 大附件自动落盘 + 通过 `read_pdf` / `anything_to_md` 工具按需读
+
+### 📚 记忆系统
+- **SOUL.md** — 人设（你创建，长期不变，每轮注入 system prompt）
+- **MEMORY.md** — 长期记忆（Agent 通过 `update_memory` 工具自主维护，每次写入前自动 archive 备份，保留最近 30 份）
+- **每日 digest** — 每天首次对话时自动生成"昨日摘要"并 embed 入向量库
+- **会话历史** — SQLite 持久化，断电重启不丢
+- **向量召回（可选）** — bge-m3 1024-d 向量，覆盖消息 / digest / Markdown 分块；每轮回复前 top-k 语义召回注入
+
+### 🛠️ 工具集（23 个）
+
+| 类别 | 工具 |
+|---|---|
+| **记忆** | `update_memory` · `search_memory` · `search_memory_semantic` |
+| **网络** | `web_fetch`（含 readability 正文提取）· `web_search` · `download_to_disk` |
+| **多模态** | `generate_image`（gpt-image-2 / DALL·E-3 兼容）· `read_pdf` · `anything_to_md` · `browser_capture`（无头浏览器截图 + 抓正文） |
+| **飞书** | `send_to_feishu`（主动推图 / 文件 / 卡片） |
+| **文件** | `read_local_file` · `write_local_file` · `create_directory` · `list_directory` · `move_path` · `copy_path` · `delete_path` |
+| **Shell** | `run_command`（带超时 + 输出截断） |
+| **Skills** | `list_skills` · `load_skill` · `install_skill` · `uninstall_skill`（[AgentSkills](https://agentskills.io) 标准格式） |
+
+### ⚙️ 工程细节
+- httpx 细分 timeout（connect 10s / read 60s）+ 单次重试，避免上游慢导致事件循环假死
+- SQLite 写入走 `asyncio.to_thread`，不阻塞主循环
+- Fire-and-forget 后台任务统一异常捕获 + 日志，不会静默死掉
+- `LaunchAgent` (macOS) / `systemd` (Linux) 友好的前台阻塞模式
 
 ---
 
