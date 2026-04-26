@@ -1098,12 +1098,10 @@ def make_read_pdf_tool() -> Tool:
 import shutil
 import subprocess
 
-# Absolute path first (LaunchAgent PATH usually doesn't include
-# ~/.local/bin), then fall back to shutil.which at import time for
-# flexibility on other machines.
-_TOMD_BIN = "/Users/xbg/.local/bin/tomd"
-if not Path(_TOMD_BIN).exists():
-    _TOMD_BIN = shutil.which("tomd") or _TOMD_BIN
+# Resolve via PATH first; fall back to ~/.local/bin/tomd which is
+# where `pip install --user tomd` lands and where launchd-style
+# wrappers usually can't see (PATH doesn't include it by default).
+_TOMD_BIN = shutil.which("tomd") or str(Path.home() / ".local/bin/tomd")
 
 _TOMD_MAX_CHARS = 60_000
 _TOMD_TIMEOUT = 180  # seconds — office docs + PDFs can take a while
