@@ -1,0 +1,55 @@
+# XiaoNZ Agent configuration template.
+# Copy to config.yaml and fill in. config.yaml is gitignored.
+
+feishu:
+  # From Feishu Open Platform → your custom app → "Credentials & Basic Info"
+  app_id: "cli_xxxxxxxxxxxxxxxx"
+  app_secret: "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+  # Optional, from "Events & Callbacks" page (long-connection mode does
+  # not require these, but they're checked if your app has them set).
+  verification_token: ""
+  encrypt_key: ""
+
+model:
+  # Any Anthropic-compatible Messages API endpoint:
+  #   - Official:  https://api.anthropic.com
+  #   - Self-hosted gateway / proxy: e.g. http://127.0.0.1:8080
+  base_url: "https://api.anthropic.com"
+  auth_token: "sk-ant-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+  model_id: "claude-opus-4-7"
+  max_tokens: 8192
+  # httpx timeouts. Tight by design — past incidents had the agent freeze
+  # for hours after long timeouts on flaky upstreams.
+  connect_timeout: 10.0
+  read_timeout: 60.0
+  max_retries: 1
+  # Optional: OpenAI-compatible path on the same gateway for image
+  # generation. Leave empty/unset to disable the generate_image tool.
+  openai_auth_token: ""
+  image_model: "gpt-image-2"
+
+agent:
+  # Max tool-calling iterations per user turn
+  max_iterations: 20
+
+memory:
+  # Max conversation turns kept in session history (1 turn = 1 user + 1 assistant)
+  max_session_turns: 20
+
+embedding:
+  # Semantic recall over past messages, daily digests, and MEMORY.md.
+  # Disabled by default — set enabled=true and point base_url at any
+  # OpenAI-compatible /v1/embeddings endpoint to turn it on.
+  #
+  # Recommended: bge-m3 via Ollama:
+  #   ollama pull bge-m3
+  #   ollama serve   # → http://127.0.0.1:11434/v1
+  #
+  # Alternatives: HuggingFace text-embeddings-inference (TEI), OpenAI's
+  # text-embedding-3-large (set dim=3072), self-hosted bge-m3 etc.
+  enabled: false
+  base_url: "http://127.0.0.1:11434/v1"
+  model: "bge-m3"
+  dim: 1024
+  recall_top_k: 5
+  recall_min_score: 0.45

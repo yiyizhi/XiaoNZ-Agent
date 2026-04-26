@@ -1,0 +1,39 @@
+# ── Secrets ────────────────────────────────────────────────────
+config.yaml
+.env
+*.token
+
+# ── Python ─────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+.venv/
+env/
+.pytest_cache/
+*.egg-info/
+
+# ── Runtime data ───────────────────────────────────────────────
+# Ignore everything under data/ except the memory scaffolding
+# (templates + docs that ship with the repo).
+data/*
+!data/memory/
+data/memory/*
+!data/memory/*.example
+!data/memory/README.md
+
+# ── OS / Editor ────────────────────────────────────────────────
+.DS_Store
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# ── Logs ───────────────────────────────────────────────────────
+logs/
+*.log
+
+# ── Local docs (internal design notes) ─────────────────────────
+docs/
