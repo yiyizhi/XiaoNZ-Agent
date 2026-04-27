@@ -78,7 +78,7 @@ async def main() -> int:
     memory = MemoryStore(settings.memory_path)
     skills = SkillStore(settings.skills_dir)
     model = ModelClient(settings)
-    tools = default_tools(skills=skills, memory=memory)
+    tools = default_tools(skills=skills, memory=memory, db_path=settings.db_path)
     agent = AgentLoop(settings, store, model, skills=skills, tools=tools)
     commands = CommandHandler(store, memory, skills)
     client = FeishuClient(settings, store, agent, commands)

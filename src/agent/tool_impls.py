@@ -1700,15 +1700,16 @@ def make_filesystem_tools() -> list[Tool]:
         dangerous = {Path.home().resolve(), Path("/").resolve()}
         if resolved in dangerous or len(resolved.parts) <= 2:
             return f"ERROR: 拒绝删除系统关键路径：{resolved}"
+        was_dir = p.is_dir()
         import shutil
         try:
-            if p.is_dir():
+            if was_dir:
                 shutil.rmtree(str(p))
             else:
                 p.unlink()
         except Exception as e:
             return f"ERROR: {e}"
-        kind = "目录" if p.is_dir() else "文件"
+        kind = "目录" if was_dir else "文件"
         return f"OK: 已删除{kind} {p}"
 
     delete_tool = Tool(
@@ -1835,7 +1836,7 @@ def make_filesystem_tools() -> list[Tool]:
 
 # ── memory search ─────────────────────────────────────────────────
 
-def make_search_memory_tool(memory: MemoryStore) -> Tool:
+def make_search_memory_tool(memory: MemoryStore, db_path: Path) -> Tool:
     """Tool for the agent to search daily digests and memory backups."""
     from .session import SessionStore
 
@@ -1846,10 +1847,6 @@ def make_search_memory_tool(memory: MemoryStore) -> Tool:
             keyword = (input_data.get("keyword") or "").strip()
             if not keyword:
                 return "ERROR: 'keyword' is required for search_digests."
-            # We need the SessionStore — get it from the memory path's
-            # sibling db. This is a bit roundabout but avoids plumbing
-            # changes.
-            db_path = memory.path.parent.parent / "xiaonz.db"
             if not db_path.is_file():
                 return "没有找到数据库文件。"
             store = SessionStore(db_path)
@@ -1862,7 +1859,6 @@ def make_search_memory_tool(memory: MemoryStore) -> Tool:
             return "\n\n".join(lines)
 
         if action == "list_digests":
-            db_path = memory.path.parent.parent / "xiaonz.db"
             if not db_path.is_file():
                 return "没有找到数据库文件。"
             store = SessionStore(db_path)
@@ -1879,7 +1875,6 @@ def make_search_memory_tool(memory: MemoryStore) -> Tool:
             date_str = (input_data.get("date") or "").strip()
             if not date_str:
                 return "ERROR: 'date' is required (格式 YYYY-MM-DD)."
-            db_path = memory.path.parent.parent / "xiaonz.db"
             if not db_path.is_file():
                 return "没有找到数据库文件。"
             store = SessionStore(db_path)
@@ -2067,14 +2062,16 @@ def make_search_memory_semantic_tool(vector_memory: Any) -> Tool:
 
 # ── convenience bundle ────────────────────────────────────────────
 
-def default_tools(skills: SkillStore, memory: MemoryStore) -> list[Tool]:
+def default_tools(
+    skills: SkillStore, memory: MemoryStore, db_path: Path,
+) -> list[Tool]:
     return [
         make_list_skills_tool(skills),
         make_load_skill_tool(skills),
         make_install_skill_tool(skills),
         make_uninstall_skill_tool(skills),
         make_update_memory_tool(memory),
-        make_search_memory_tool(memory),
+        make_search_memory_tool(memory, db_path),
         make_web_search_tool(),
         make_web_fetch_tool(),
         make_download_to_disk_tool(),

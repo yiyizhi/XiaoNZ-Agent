@@ -81,7 +81,7 @@ def main() -> int:
             settings.embedding.recall_min_score,
         )
 
-    tools = default_tools(skills=skills, memory=memory)
+    tools = default_tools(skills=skills, memory=memory, db_path=settings.db_path)
     agent = AgentLoop(
         settings, store, model, skills=skills, tools=tools,
         vector_memory=vector_memory,
