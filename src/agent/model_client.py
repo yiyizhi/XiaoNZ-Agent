@@ -65,7 +65,12 @@ class ModelClient:
             len(tools) if tools else 0,
         )
 
-        response = await self._client.messages.create(**kwargs)
+        # Streaming avoids ReadTimeout on long generations: the client's
+        # read_timeout becomes a per-chunk inactivity threshold instead
+        # of a wall-clock cap on the whole response. We still return a
+        # final Message object so callers see the same shape as before.
+        async with self._client.messages.stream(**kwargs) as stream:
+            response = await stream.get_final_message()
 
         usage = getattr(response, "usage", None)
         if usage is not None:
