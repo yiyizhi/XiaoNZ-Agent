@@ -24,8 +24,9 @@ stale tool plumbing.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
-import time
+from collections import Counter
 from datetime import date, timedelta
 from typing import Any, Optional
 
@@ -42,27 +43,25 @@ logger = logging.getLogger(__name__)
 # repeating the check + LLM call on every single turn).
 _last_digest_check: str | None = None
 
-# Strong refs for fire-and-forget tasks so the GC doesn't drop them
-# mid-flight (asyncio only weakly refs scheduled tasks).
-_bg_tasks: set[asyncio.Task] = set()
+# Repeat-call circuit breaker thresholds. Same (tool_name, input) within
+# one turn: at WARN we still run but inject a nudge; past HARD we stop
+# calling and break out of the loop. Tuned from a real incident where
+# the model spammed `python -m http.server &` + `lsof | kill` >10 rounds.
+_REPEAT_WARN = 2
+_REPEAT_HARD = 4
+
+# Per-tool hard ceiling enforced at the loop level. Individual tools may
+# have their own (e.g. run_command's 120s) — this is the outer fence so
+# a hung playwright / httpx await can't freeze the whole event loop.
+_TOOL_HARD_TIMEOUT = 180
 
 
-def _spawn_bg(coro, label: str) -> None:
-    """Schedule a fire-and-forget coroutine. Logs exceptions instead of
-    letting them get swallowed when the task is GC'd."""
-    task = asyncio.create_task(coro, name=label)
-    _bg_tasks.add(task)
-
-    def _done(t: asyncio.Task) -> None:
-        _bg_tasks.discard(t)
-        if t.cancelled():
-            return
-        exc = t.exception()
-        if exc is not None:
-            logger.warning("bg_task_failed label=%s err=%r", label, exc)
-
-    task.add_done_callback(_done)
-
+def _tool_signature(name: str, payload: Any) -> str:
+    try:
+        s = json.dumps(payload, sort_keys=True, ensure_ascii=False, default=str)
+    except Exception:
+        s = str(payload)
+    return f"{name}|{s}"
 
 def _block_to_dict(block: Any) -> dict[str, Any]:
     """Convert an Anthropic SDK content block to a plain dict suitable
@@ -246,18 +245,7 @@ class AgentLoop:
             len(messages),
             len(summary),
         )
-
-        # Embed digest so it becomes semantically recallable.
-        if self.vector_memory is not None:
-            _spawn_bg(
-                self.vector_memory.add(
-                    kind="digest",
-                    text=summary,
-                    source_ref=f"digest:{yesterday}",
-                    meta={"date": yesterday, "msg_count": len(messages)},
-                ),
-                label=f"vec.add.digest:{yesterday}",
-            )
+        # Vector indexing of this digest is handled by the nightly cron.
 
     # ── compression ────────────────────────────────────────────────
 
@@ -349,11 +337,24 @@ class AgentLoop:
             logger.warning("tool.unknown name=%s", name)
             return f"ERROR: unknown tool '{name}'"
         try:
-            result = await tool.handler(input_data or {})
+            result = await asyncio.wait_for(
+                tool.handler(input_data or {}),
+                timeout=_TOOL_HARD_TIMEOUT,
+            )
             if not isinstance(result, str):
                 result = str(result)
             logger.info("tool.ok name=%s out_chars=%d", name, len(result))
             return result
+        except asyncio.TimeoutError:
+            logger.warning(
+                "tool.timeout name=%s seconds=%d",
+                name,
+                _TOOL_HARD_TIMEOUT,
+            )
+            return (
+                f"ERROR: 工具 `{name}` 执行超过 {_TOOL_HARD_TIMEOUT} 秒被强制中止。"
+                "请换种方式或停下来回复用户。"
+            )
         except Exception as e:
             logger.exception("tool.failed name=%s", name)
             return f"ERROR: {type(e).__name__}: {e}"
@@ -381,19 +382,10 @@ class AgentLoop:
         self.store.ensure_session(session_id, source, peer_id)
         self.store.append_message(session_id, "user", user_text)
 
-        # Fire-and-forget: embed the user message so future turns can
-        # semantically recall it. Never blocks the main flow.
-        if self.vector_memory is not None and user_text.strip():
-            ts = time.time()
-            _spawn_bg(
-                self.vector_memory.add(
-                    kind="message",
-                    text=user_text,
-                    source_ref=f"msg:{session_id}:{ts:.0f}:user",
-                    meta={"role": "user", "session_id": session_id},
-                ),
-                label=f"vec.add.user:{session_id}",
-            )
+        # Embedding writes are intentionally NOT done here. A nightly cron
+        # (scripts/bootstrap_memory.py) walks the messages table and
+        # back-fills the vector store, so the live request path never
+        # touches the embedder. See ai.xiaonz.embed-daily.plist.
 
         # Generate yesterday's daily digest if we haven't already today.
         await self._maybe_generate_daily_digest()
@@ -455,6 +447,8 @@ class AgentLoop:
         )
 
         final_text: str = ""
+        call_counts: Counter[str] = Counter()
+        repeat_break_name: str | None = None
         for iteration in range(max_iter):
             response = await self.model.create_message(
                 messages=messages,
@@ -479,13 +473,46 @@ class AgentLoop:
                 # Run every tool sequentially — MVP, no parallelism
                 tool_results: list[dict] = []
                 for tu in tool_uses:
+                    sig = _tool_signature(tu.name, tu.input)
+                    call_counts[sig] += 1
+                    n = call_counts[sig]
                     logger.info(
-                        "tool.call iter=%d name=%s id=%s",
+                        "tool.call iter=%d name=%s id=%s repeat=%d",
                         iteration,
                         tu.name,
                         tu.id,
+                        n,
                     )
+
+                    if n > _REPEAT_HARD:
+                        logger.warning(
+                            "loop.repeat_break session=%s name=%s count=%d",
+                            session_id,
+                            tu.name,
+                            n,
+                        )
+                        repeat_break_name = tu.name
+                        tool_results.append(
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": tu.id,
+                                "content": (
+                                    f"ABORT: 工具 `{tu.name}` 已被相同参数调用 {n} 次，"
+                                    "判定死循环，本轮已终止。请停下来给用户回复。"
+                                ),
+                                "is_error": True,
+                            }
+                        )
+                        continue
+
                     result_text = await self._run_tool(tu.name, tu.input)
+                    if n >= _REPEAT_WARN:
+                        result_text = (
+                            f"⚠️ 注意：你已用完全相同的参数调用过 `{tu.name}` {n} 次。"
+                            f"再调一次大概率仍是同样结果——请换种方式或停下来回复用户。"
+                            f"重复 {_REPEAT_HARD} 次将自动熔断。\n\n"
+                            + result_text
+                        )
                     tool_results.append(
                         {
                             "type": "tool_result",
@@ -494,6 +521,12 @@ class AgentLoop:
                         }
                     )
                 messages.append({"role": "user", "content": tool_results})
+                if repeat_break_name is not None:
+                    final_text = (
+                        f"（小宁子检测到工具 `{repeat_break_name}` 在死循环里反复调用，"
+                        "已自动停下。请换个方式描述需求或者直接告诉我下一步该做什么。）"
+                    )
+                    break
                 continue
 
             # stop_reason in {"end_turn", "max_tokens", "stop_sequence"}
@@ -512,22 +545,5 @@ class AgentLoop:
             )
 
         self.store.append_message(session_id, "assistant", final_text)
-
-        # Fire-and-forget embed of the assistant reply.
-        if (
-            self.vector_memory is not None
-            and final_text.strip()
-            and final_text != "(no response)"
-        ):
-            ts = time.time()
-            _spawn_bg(
-                self.vector_memory.add(
-                    kind="message",
-                    text=final_text,
-                    source_ref=f"msg:{session_id}:{ts:.0f}:assistant",
-                    meta={"role": "assistant", "session_id": session_id},
-                ),
-                label=f"vec.add.assistant:{session_id}",
-            )
-
+        # Assistant reply is indexed by the nightly cron, not here.
         return final_text
