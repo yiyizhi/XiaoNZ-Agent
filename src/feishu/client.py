@@ -73,6 +73,26 @@ MAX_PDF_PAGES = 10            # cap long PDFs at ingest; full read via tool
 _UNSAFE_NAME_CHARS = re.compile(r'[/\\:*?"<>|\x00-\x1f]')
 
 
+def _friendly_error_text(exc: BaseException) -> str:
+    """Render an exception as user-facing chat text. Hides stack traces /
+    library internals — the full traceback is already in the log."""
+    # Lazy import: anthropic types aren't worth a top-level import here.
+    from anthropic import APIConnectionError, APIStatusError, APITimeoutError, RateLimitError
+
+    if isinstance(exc, APITimeoutError) or isinstance(exc, httpx.TimeoutException):
+        return "网关响应慢了点没接住，麻烦再发一遍～"
+    if isinstance(exc, RateLimitError):
+        return "模型限流了，等一会再试。"
+    if isinstance(exc, APIConnectionError) or isinstance(exc, httpx.ConnectError):
+        return "连不上模型网关，过会儿再试。"
+    if isinstance(exc, APIStatusError):
+        status = getattr(exc, "status_code", None)
+        if status and 500 <= status < 600:
+            return "模型服务暂时不稳定，稍后再来一次。"
+        return "请求被网关拒绝了，可能是这次内容触发了限制，换个说法再试？"
+    return "我这边出了点小问题，待会再聊？"
+
+
 def _decode_text_file(data: bytes) -> str | None:
     """Best-effort: decode as UTF-8 and reject anything that looks like
     binary (null bytes / decode failure). Returns the decoded text
@@ -482,7 +502,7 @@ class FeishuClient:
 
         except Exception as e:
             logger.exception("feishu.turn_failed msg_id=%s", message_id)
-            err_text = f"抱歉，我这边出了点问题：{e}"
+            err_text = _friendly_error_text(e)
             try:
                 await self._deliver_reply(
                     loop, card_msg_id, receive_id, receive_id_type, err_text
