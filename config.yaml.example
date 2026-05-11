@@ -36,6 +36,19 @@ memory:
   # Max conversation turns kept in session history (1 turn = 1 user + 1 assistant)
   max_session_turns: 20
 
+search:
+  # web_search cascade: Tavily → Brave → DuckDuckGo. Each layer is
+  # skipped if its key isn't set; the next layer kicks in on error or
+  # empty results. With no keys at all, DDG-only (no key required).
+  #
+  # Tavily — LLM-tuned re-ranking + AI summary. Best general quality.
+  # Get a key at https://tavily.com (free tier ~1000 queries/month).
+  tavily_api_key: ""
+  # Brave — independent index refreshed daily, strong on timeliness and
+  # CJK queries. Get a key at https://api.search.brave.com (free tier
+  # 2000 queries/month, 1 qps).
+  brave_api_key: ""
+
 embedding:
   # Semantic recall over past messages, daily digests, and MEMORY.md.
   # Disabled by default — set enabled=true and point base_url at any

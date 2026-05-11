@@ -336,7 +336,163 @@ def make_web_fetch_tool() -> Tool:
     )
 
 
-def _sync_web_search(query: str, max_results: int) -> str:
+_CJK_RE = re.compile(r"[\u4e00-\u9fff]")
+
+
+def _is_chinese_query(query: str) -> bool:
+    """True if the query has any CJK ideograph — used to bias engines
+    that take an explicit locale/lang (Brave) toward Chinese results."""
+    return bool(_CJK_RE.search(query))
+
+
+def _format_hits(
+    query: str,
+    hits: list[tuple[str, str, str]],
+    answer: str | None = None,
+) -> str:
+    if not hits:
+        return f"(no results for {query!r})"
+    lines = [f"# 搜索结果：{query}", ""]
+    if answer:
+        lines.append(f"**AI 摘要**: {answer.strip()}")
+        lines.append("")
+    for i, (title, href, snippet) in enumerate(hits, 1):
+        lines.append(f"{i}. **{title}**")
+        lines.append(f"   {href}")
+        if snippet:
+            lines.append(f"   {snippet}")
+        lines.append("")
+    return "\n".join(lines).strip()
+
+
+# freshness → Tavily time_range ("day"/"week"/"month"/"year"; Tavily
+# accepts the same words).
+# freshness → Brave freshness code ("pd"/"pw"/"pm"/"py" = past day / week
+# / month / year).
+_BRAVE_FRESHNESS = {
+    "day": "pd", "week": "pw", "month": "pm", "year": "py",
+}
+
+
+def _sync_tavily_search(
+    query: str,
+    max_results: int,
+    api_key: str,
+    freshness: str | None = None,
+    topic: str = "general",
+) -> str:
+    """Call Tavily's /search REST endpoint. `topic="news"` switches
+    Tavily's news-tuned index (better for breaking events). `freshness`
+    narrows to the last day/week/month/year. Tavily's `include_answer`
+    is enabled so the LLM-synthesized summary can be prepended to the
+    formatted output — this is the single biggest accuracy win Tavily
+    offers over a plain SERP. Returns 'ERROR:' on failure so the caller
+    can fall through to Brave / DDG."""
+    payload: dict[str, Any] = {
+        "api_key": api_key,
+        "query": query,
+        "max_results": max_results,
+        "search_depth": "basic",
+        "include_answer": "basic",
+        "topic": topic if topic in ("general", "news") else "general",
+    }
+    if freshness in ("day", "week", "month", "year"):
+        payload["time_range"] = freshness
+
+    try:
+        with httpx.Client(timeout=15.0) as c:
+            resp = c.post(
+                "https://api.tavily.com/search",
+                json=payload,
+                headers={"Content-Type": "application/json"},
+            )
+    except httpx.HTTPError as e:
+        return f"ERROR: tavily failed: {type(e).__name__}: {e}"
+
+    if resp.status_code != 200:
+        body_preview = resp.text[:200] if resp.text else ""
+        return f"ERROR: tavily HTTP {resp.status_code}: {body_preview}"
+
+    try:
+        data = resp.json()
+    except Exception as e:
+        return f"ERROR: tavily couldn't parse JSON: {e}"
+
+    results = data.get("results") or []
+    hits: list[tuple[str, str, str]] = []
+    for item in results[:max_results]:
+        title = (item.get("title") or "").strip()
+        href = (item.get("url") or "").strip()
+        snippet = (item.get("content") or "").strip()
+        if not href:
+            continue
+        hits.append((title or href, href, snippet))
+
+    answer = (data.get("answer") or "").strip() or None
+    return _format_hits(query, hits, answer=answer)
+
+
+def _sync_brave_search(
+    query: str,
+    max_results: int,
+    api_key: str,
+    freshness: str | None = None,
+) -> str:
+    """Call Brave Web Search API. Independent index refreshed daily —
+    used as the second layer for timeliness when Tavily misses. CJK
+    queries auto-set search_lang=zh-hans + country=CN so Chinese
+    sources rank ahead. `text_decorations=false` strips the <strong>
+    tags Brave adds to highlight matched terms in descriptions.
+    Returns 'ERROR:' on failure so the caller can fall through to
+    DDG."""
+    params: dict[str, Any] = {
+        "q": query,
+        "count": max_results,
+        "text_decorations": "false",
+        "safesearch": "moderate",
+    }
+    if _is_chinese_query(query):
+        params["search_lang"] = "zh-hans"
+        params["country"] = "CN"
+    if freshness in _BRAVE_FRESHNESS:
+        params["freshness"] = _BRAVE_FRESHNESS[freshness]
+
+    try:
+        with httpx.Client(timeout=15.0) as c:
+            resp = c.get(
+                "https://api.search.brave.com/res/v1/web/search",
+                params=params,
+                headers={
+                    "X-Subscription-Token": api_key,
+                    "Accept": "application/json",
+                },
+            )
+    except httpx.HTTPError as e:
+        return f"ERROR: brave failed: {type(e).__name__}: {e}"
+
+    if resp.status_code != 200:
+        body_preview = resp.text[:200] if resp.text else ""
+        return f"ERROR: brave HTTP {resp.status_code}: {body_preview}"
+
+    try:
+        data = resp.json()
+    except Exception as e:
+        return f"ERROR: brave couldn't parse JSON: {e}"
+
+    web_results = ((data.get("web") or {}).get("results") or [])
+    hits: list[tuple[str, str, str]] = []
+    for item in web_results[:max_results]:
+        title = (item.get("title") or "").strip()
+        href = (item.get("url") or "").strip()
+        snippet = (item.get("description") or "").strip()
+        if not href:
+            continue
+        hits.append((title or href, href, snippet))
+
+    return _format_hits(query, hits)
+
+
+def _sync_ddg_search(query: str, max_results: int) -> str:
     """Scrape DuckDuckGo's plain-HTML endpoint. Returns a
     human-readable numbered list, one hit per entry with title / URL
     / snippet. No API key, no JSON, but works reliably on Python 3.9
@@ -402,41 +558,101 @@ def _sync_web_search(query: str, max_results: int) -> str:
         if len(hits) >= max_results:
             break
 
-    if not hits:
-        return f"(no results for {query!r})"
-
-    lines = [f"# 搜索结果：{query}", ""]
-    for i, (title, href, snippet) in enumerate(hits, 1):
-        lines.append(f"{i}. **{title}**")
-        lines.append(f"   {href}")
-        if snippet:
-            lines.append(f"   {snippet}")
-        lines.append("")
-    return "\n".join(lines).strip()
+    return _format_hits(query, hits)
 
 
-def make_web_search_tool() -> Tool:
+def _is_usable_result(out: str) -> bool:
+    return not out.startswith("ERROR:") and not out.startswith("(no results")
+
+
+def _sync_web_search(
+    query: str,
+    max_results: int,
+    tavily_api_key: str | None,
+    brave_api_key: str | None,
+    freshness: str | None = None,
+    topic: str = "general",
+) -> str:
+    """Cascade: Tavily (LLM-tuned summaries) → Brave (independent
+    index, strong on freshness) → DDG (no-key emergency fallback).
+    Each layer is skipped if its key isn't configured, and we fall
+    through on either ERROR or empty results."""
+    if tavily_api_key:
+        out = _sync_tavily_search(
+            query, max_results, tavily_api_key, freshness, topic,
+        )
+        if _is_usable_result(out):
+            return out
+        logger.warning(
+            "tool.web_search tavily fallback: %s",
+            out.splitlines()[0] if out else "<empty>",
+        )
+
+    if brave_api_key:
+        out = _sync_brave_search(
+            query, max_results, brave_api_key, freshness,
+        )
+        if _is_usable_result(out):
+            return out
+        logger.warning(
+            "tool.web_search brave fallback: %s",
+            out.splitlines()[0] if out else "<empty>",
+        )
+
+    return _sync_ddg_search(query, max_results)
+
+
+def make_web_search_tool(
+    tavily_api_key: str | None = None,
+    brave_api_key: str | None = None,
+) -> Tool:
     async def handler(input_data: dict) -> str:
         query = (input_data.get("query") or "").strip()
         if not query:
             return "ERROR: 'query' is required."
-        logger.info("tool.web_search query=%s disabled=true", query)
-        return (
-            "web_search 暂不可用（DuckDuckGo 端点在当前网络不可达）。"
-            "请不要再调用 web_search 或 web_fetch，"
-            "直接基于已掌握的信息回答用户；"
-            "如果确实需要最新数据，告诉用户能力暂时不可用。"
+        max_results = input_data.get("max_results") or 5
+        try:
+            max_results = max(1, min(10, int(max_results)))
+        except (TypeError, ValueError):
+            max_results = 5
+        freshness = input_data.get("freshness")
+        if freshness not in ("day", "week", "month", "year"):
+            freshness = None
+        topic = input_data.get("topic") or "general"
+        if topic not in ("general", "news"):
+            topic = "general"
+
+        layers = []
+        if tavily_api_key:
+            layers.append("tavily")
+        if brave_api_key:
+            layers.append("brave")
+        layers.append("ddg")
+
+        logger.info(
+            "tool.web_search query=%s max=%d freshness=%s topic=%s cascade=%s",
+            query, max_results, freshness, topic, "→".join(layers),
+        )
+        return await asyncio.to_thread(
+            _sync_web_search,
+            query, max_results,
+            tavily_api_key, brave_api_key,
+            freshness, topic,
         )
 
     return Tool(
         name="web_search",
         description=(
-            "Search the web via DuckDuckGo and return the top results "
-            "(title + URL + snippet). Use this when the user asks about "
-            "something that needs fresh information (news, versions, "
-            "docs, prices, etc.) or when you're unsure and want to "
-            "verify before answering. Follow up with web_fetch on the "
-            "most relevant link to read the full page."
+            "Search the web and return the top results (title + URL + "
+            "snippet, plus an AI summary when available). Cascade: "
+            "Tavily (LLM-tuned) → Brave (independent index) → "
+            "DuckDuckGo. Use this when the user asks about something "
+            "that needs fresh information (news, versions, docs, "
+            "prices, new crypto/AI projects, etc.) or when you're "
+            "unsure and want to verify before answering. For "
+            "time-sensitive queries set `freshness` and/or `topic=news` "
+            "— this materially improves recency. Follow up with "
+            "web_fetch on the most relevant link to read the full page."
         ),
         input_schema={
             "type": "object",
@@ -446,7 +662,8 @@ def make_web_search_tool() -> Tool:
                     "description": (
                         "Search query. Plain natural language works; "
                         "for best results be specific and include "
-                        "distinctive keywords."
+                        "distinctive keywords (project name, version "
+                        "number, ticker, date, etc.)."
                     ),
                 },
                 "max_results": {
@@ -454,6 +671,28 @@ def make_web_search_tool() -> Tool:
                     "description": "1–10, default 5.",
                     "minimum": 1,
                     "maximum": 10,
+                },
+                "freshness": {
+                    "type": "string",
+                    "enum": ["day", "week", "month", "year"],
+                    "description": (
+                        "Time filter. Use 'day' for breaking news / "
+                        "just-launched projects, 'week' for recent "
+                        "updates, 'month'/'year' for slower-moving "
+                        "topics. Omit if recency isn't required — "
+                        "narrowing too aggressively can drop good "
+                        "older sources."
+                    ),
+                },
+                "topic": {
+                    "type": "string",
+                    "enum": ["general", "news"],
+                    "description": (
+                        "Set to 'news' for time-sensitive queries "
+                        "(breaking events, just-announced projects); "
+                        "this switches Tavily to its news-tuned index. "
+                        "Default 'general' covers everything else."
+                    ),
                 },
             },
             "required": ["query"],
@@ -1414,11 +1653,40 @@ _CMD_TIMEOUT = 120  # seconds
 _CMD_MAX_OUTPUT = 20_000  # chars returned to model
 
 
+_BG_AMP_RE = re.compile(r"&\s*(?:$|[;\n])")
+
+
+def _has_bare_background_amp(cmd: str) -> bool:
+    """Detect a bare `&` used to background a command.
+
+    Trap: `subprocess.run(capture_output=True)` with a backgrounded
+    child means the grandchild inherits the stdout/stderr pipe. The
+    parent's `communicate()` blocks until the grandchild closes its
+    fds — i.e. forever for a long-lived `python -m http.server &`.
+    The model has hit this twice in one night, so we reject at the
+    tool layer instead of relying on outer timeouts.
+    """
+    cleaned = cmd
+    for noise in ("&&", "||", "2>&1", "1>&2", ">&", "|&"):
+        cleaned = cleaned.replace(noise, " ")
+    return bool(_BG_AMP_RE.search(cleaned))
+
+
 def make_run_command_tool() -> Tool:
     async def handler(input_data: dict) -> str:
         command = (input_data.get("command") or "").strip()
         if not command:
             return "ERROR: 'command' is required."
+        if _has_bare_background_amp(command):
+            logger.warning("tool.run_command rejected_background cmd=%s", command[:200])
+            return (
+                "ERROR: 拒绝执行——命令里包含 `&` 后台启动符。\n"
+                "原因：subprocess 跑后台进程会让 stdout/stderr pipe 永远不关，整个工具调用会卡死。\n"
+                "如果你需要起一个长驻服务（http server 之类）：\n"
+                "  1) 用 `nohup CMD >/tmp/svc.log 2>&1 </dev/null & disown` 完整断开 fd；或\n"
+                "  2) 直接用前台命令 + 短超时验证，不要起后台。\n"
+                "如果你只是要测试网页渲染——直接用 `browser_capture` 工具传 `file://` 路径，根本不需要起 http server。"
+            )
         cwd = input_data.get("working_directory")
         if cwd:
             cwd = str(Path(cwd).expanduser())
@@ -2063,7 +2331,11 @@ def make_search_memory_semantic_tool(vector_memory: Any) -> Tool:
 # ── convenience bundle ────────────────────────────────────────────
 
 def default_tools(
-    skills: SkillStore, memory: MemoryStore, db_path: Path,
+    skills: SkillStore,
+    memory: MemoryStore,
+    db_path: Path,
+    tavily_api_key: str | None = None,
+    brave_api_key: str | None = None,
 ) -> list[Tool]:
     return [
         make_list_skills_tool(skills),
@@ -2072,7 +2344,10 @@ def default_tools(
         make_uninstall_skill_tool(skills),
         make_update_memory_tool(memory),
         make_search_memory_tool(memory, db_path),
-        make_web_search_tool(),
+        make_web_search_tool(
+            tavily_api_key=tavily_api_key,
+            brave_api_key=brave_api_key,
+        ),
         make_web_fetch_tool(),
         make_download_to_disk_tool(),
         make_read_pdf_tool(),

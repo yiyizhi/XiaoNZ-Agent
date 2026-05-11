@@ -81,7 +81,13 @@ def main() -> int:
             settings.embedding.recall_min_score,
         )
 
-    tools = default_tools(skills=skills, memory=memory, db_path=settings.db_path)
+    tools = default_tools(
+        skills=skills,
+        memory=memory,
+        db_path=settings.db_path,
+        tavily_api_key=settings.search.tavily_api_key,
+        brave_api_key=settings.search.brave_api_key,
+    )
     agent = AgentLoop(
         settings, store, model, skills=skills, tools=tools,
         vector_memory=vector_memory,

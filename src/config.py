@@ -42,6 +42,14 @@ class MemoryConfig(BaseModel):
     max_session_turns: int = 20
 
 
+class SearchConfig(BaseModel):
+    # Web search backend cascade: Tavily → Brave → DuckDuckGo. Each
+    # layer kicks in only when the previous one errors or returns no
+    # hits. Keys are optional — leave empty to skip that layer.
+    tavily_api_key: Optional[str] = None
+    brave_api_key: Optional[str] = None
+
+
 class EmbeddingConfig(BaseModel):
     # OpenAI-compatible /v1/embeddings endpoint. Default points at a
     # local Ollama instance (`ollama pull bge-m3` + `ollama serve`).
@@ -61,6 +69,7 @@ class Settings(BaseModel):
     model: ModelConfig
     agent: AgentConfig = Field(default_factory=AgentConfig)
     memory: MemoryConfig = Field(default_factory=MemoryConfig)
+    search: SearchConfig = Field(default_factory=SearchConfig)
     embedding: EmbeddingConfig = Field(default_factory=EmbeddingConfig)
 
     # Derived paths (filled by load())
