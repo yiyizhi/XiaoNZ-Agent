@@ -36,6 +36,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import re
 import threading
 import time
@@ -189,6 +190,131 @@ def _parse_text_content(raw: str | None) -> str:
     return " ".join(parts).strip() or text.strip()
 
 
+def _str(value) -> str:
+    return value if isinstance(value, str) else ""
+
+
+def _render_post_element(element) -> str:
+    """Render one element from a Feishu post message paragraph.
+
+    Mirrors OpenClaw's extensions/feishu/src/post.ts:renderElement, but skips
+    markdown escaping since the output is fed to the LLM, not a renderer.
+    """
+    if not isinstance(element, dict):
+        return _str(element)
+    tag = _str(element.get("tag")).lower()
+    if tag == "text":
+        return _str(element.get("text"))
+    if tag == "a":
+        href = _str(element.get("href")).strip()
+        text = _str(element.get("text")) or href
+        if not text:
+            return ""
+        return f"[{text}]({href})" if href else text
+    if tag == "at":
+        name = (
+            _str(element.get("user_name"))
+            or _str(element.get("user_id"))
+            or _str(element.get("open_id"))
+        )
+        return f"@{name}" if name else ""
+    if tag == "img":
+        return "![image]"
+    if tag == "media":
+        file_name = _str(element.get("file_name"))
+        return f"[media: {file_name}]" if file_name else "[media]"
+    if tag == "emotion":
+        return (
+            _str(element.get("emoji"))
+            or _str(element.get("text"))
+            or _str(element.get("emoji_type"))
+        )
+    if tag in ("md", "lark_md"):
+        return _str(element.get("text")) or _str(element.get("content"))
+    if tag == "br":
+        return "\n"
+    if tag == "hr":
+        return "\n\n---\n\n"
+    if tag == "code":
+        code = _str(element.get("text")) or _str(element.get("content"))
+        return f"`{code}`" if code else ""
+    if tag in ("code_block", "pre"):
+        lang = _str(element.get("language")) or _str(element.get("lang"))
+        code = (_str(element.get("text")) or _str(element.get("content"))).replace("\r\n", "\n")
+        trailing = "" if code.endswith("\n") else "\n"
+        return f"```{lang}\n{code}{trailing}```"
+    return _str(element.get("text"))
+
+
+def _resolve_post_payload(parsed):
+    """Unwrap the various shapes a post payload arrives in.
+
+    Direct: {title, content}; or wrapped under {post: {locale: {title, content}}}.
+    """
+    if isinstance(parsed, dict) and isinstance(parsed.get("content"), list):
+        return parsed
+    if not isinstance(parsed, dict):
+        return None
+    inner = parsed.get("post")
+    if isinstance(inner, dict):
+        if isinstance(inner.get("content"), list):
+            return inner
+        for v in inner.values():
+            if isinstance(v, dict) and isinstance(v.get("content"), list):
+                return v
+    for v in parsed.values():
+        if isinstance(v, dict) and isinstance(v.get("content"), list):
+            return v
+    return None
+
+
+def _parse_post_content(raw: str | None) -> str:
+    """Flatten a Feishu post (rich-text) message into plain markdown text.
+
+    Triggered when users type @-mentions, bold/italic, links, etc. — Feishu
+    upgrades the message_type from `text` to `post`. Mirrors OpenClaw's
+    parsePostContent in extensions/feishu/src/post.ts.
+    """
+    if not raw:
+        return ""
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return raw.strip()
+    payload = _resolve_post_payload(parsed)
+    if not payload:
+        return "[Rich text message]"
+    paragraphs: list[str] = []
+    for paragraph in payload.get("content", []):
+        if not isinstance(paragraph, list):
+            continue
+        paragraphs.append("".join(_render_post_element(e) for e in paragraph))
+    title = _str(payload.get("title")).strip()
+    body = "\n".join(paragraphs).strip()
+    return "\n\n".join(s for s in (title, body) if s).strip() or "[Rich text message]"
+
+
+class _LarkConnectedFilter(logging.Filter):
+    """Logging filter that taps into lark_oapi's own logger to spot
+    'Lark connected ...' lines. Each match calls `client._on_lark_connected()`
+    so the FeishuClient watchdog can detect ws flapping.
+
+    Never blocks log emission — always returns True.
+    """
+
+    def __init__(self, client: "FeishuClient"):
+        super().__init__()
+        self._client = client
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            if "Lark connected" in record.getMessage():
+                self._client._on_lark_connected()
+        except Exception:
+            pass
+        return True
+
+
 class FeishuClient:
     def __init__(
         self,
@@ -229,6 +355,24 @@ class FeishuClient:
         self._inflight_by_session: dict[str, set[str]] = {}
         self._inflight_lock = threading.Lock()
 
+        # ── Watchdog state ────────────────────────────────────────────
+        # 2026-05-12 历史教训：lark sdk 在 ws 长跑后会进入"软僵尸"——
+        # ws 反复重连还在打 "Lark connected"，但 _on_message 永不触发，
+        # 整个进程瘫痪。`launchctl kickstart -k` 救不回（SIGTERM 卡住），
+        # 必须完全重启 launchd job。所以这里加进程内主动 exit：
+        #   1. 进程跑超 8h → preemptive 重启（限制累积状态时长上限）
+        #   2. 90s 内 lark sdk 打 ≥3 次 "Lark connected" → ws flapping，立刻 exit
+        # os._exit(N) 绕过 SIGTERM graceful shutdown 死循环，让 launchd
+        # KeepAlive 直接拉新进程。
+        self._process_start_ts = time.time()
+        self._lark_connected_times: list[float] = []
+        self._lark_lock = threading.Lock()
+        # 注册日志过滤器：lark sdk 每次 ws 连接成功打 "Lark connected ..."
+        # 抓住这条日志做 ws 健康度信号
+        logging.getLogger("lark_oapi").addFilter(
+            _LarkConnectedFilter(self)
+        )
+
     # ── lifecycle ──────────────────────────────────────────────────
 
     def _start_agent_thread(self) -> None:
@@ -247,10 +391,72 @@ class FeishuClient:
         self._agent_thread = t
         logger.info("feishu.agent_thread_started")
 
+    # ── Watchdog hooks ─────────────────────────────────────────────
+
+    def _on_lark_connected(self) -> None:
+        """Called by `_LarkConnectedFilter` each time lark_oapi 打
+        'Lark connected ...' 日志。只追加时间戳，watchdog 线程做判定。
+        """
+        now = time.time()
+        with self._lark_lock:
+            self._lark_connected_times.append(now)
+            # 只保留最近 10 条，避免长跑后 list 涨大
+            if len(self._lark_connected_times) > 10:
+                self._lark_connected_times = self._lark_connected_times[-10:]
+
+    def _watchdog_loop(self) -> None:
+        """Daemon 线程：每 60s 检查 ws 健康度和进程年龄，必要时硬退出
+        让 launchd 重拉。
+
+        每 ALIVE_LOG_INTERVAL 秒还会主动写一行 `xiaonz.alive`：space-flush
+        agent.log 的 mtime，让外部 heartbeat.sh（用 mtime 判活）不会在长时间无
+        用户消息的空闲时段误判 silent 重启进程。
+        """
+        MAX_AGE_SEC = 8 * 3600   # 8 小时 preemptive 重启
+        FLAP_WINDOW = 90         # 90s 内
+        FLAP_COUNT = 3           # ≥3 次 Lark connected → ws flapping
+        ALIVE_LOG_INTERVAL = 300  # 5min: 比 heartbeat.sh 阈值 600s 小一半，确保活进程不会被误杀
+        last_alive_log = 0.0
+        while True:
+            time.sleep(60)
+            try:
+                now = time.time()
+                age = now - self._process_start_ts
+
+                if now - last_alive_log >= ALIVE_LOG_INTERVAL:
+                    logger.info("xiaonz.alive age=%.0fs", age)
+                    last_alive_log = now
+
+                if age > MAX_AGE_SEC:
+                    logger.warning(
+                        "xiaonz.watchdog.preemptive_restart age=%.0fs", age
+                    )
+                    os._exit(2)
+
+                with self._lark_lock:
+                    recent = [t for t in self._lark_connected_times
+                              if now - t <= FLAP_WINDOW]
+                if len(recent) >= FLAP_COUNT:
+                    logger.warning(
+                        "xiaonz.watchdog.ws_flapping count=%d window=%ds",
+                        len(recent), FLAP_WINDOW,
+                    )
+                    os._exit(3)
+            except Exception:
+                logger.exception("xiaonz.watchdog.tick_failed")
+
     def start(self) -> None:
         """Blocking: spin up agent thread then run lark ws.Client in
         the current (main) thread."""
         self._start_agent_thread()
+
+        # Watchdog 线程：兜底 lark sdk 的软僵尸态
+        threading.Thread(
+            target=self._watchdog_loop,
+            name="xiaonz-watchdog",
+            daemon=True,
+        ).start()
+        logger.info("xiaonz.watchdog_started")
 
         handler = (
             lark.EventDispatcherHandler.builder("", "")
@@ -292,29 +498,59 @@ class FeishuClient:
             image_key: str | None = None
 
             mtype = msg.message_type
+            try:
+                payload = json.loads(msg.content or "{}")
+            except json.JSONDecodeError:
+                payload = {}
+
+            # Routing mirrors OpenClaw's extensions/feishu/src/bot-content.ts
+            # parseMessageContent — same message_type coverage, but we also keep
+            # file_key/image_key so downstream `_run_turn` can fetch the bytes.
             if mtype == "text":
                 user_text = _parse_text_content(msg.content)
                 if not user_text:
                     return
+            elif mtype == "post":
+                user_text = _parse_post_content(msg.content)
+                if not user_text:
+                    return
             elif mtype == "file":
-                try:
-                    payload = json.loads(msg.content or "{}")
-                except json.JSONDecodeError:
-                    payload = {}
                 file_key = payload.get("file_key")
                 file_name = payload.get("file_name") or "(未命名文件)"
                 if not file_key:
                     return
                 user_text = f"（我上传了一个文件：{file_name}）"
             elif mtype == "image":
-                try:
-                    payload = json.loads(msg.content or "{}")
-                except json.JSONDecodeError:
-                    payload = {}
                 image_key = payload.get("image_key")
                 if not image_key:
                     return
                 user_text = "（我发了一张图片）"
+            elif mtype == "audio":
+                stt = payload.get("speech_to_text")
+                if isinstance(stt, str) and stt.strip():
+                    user_text = stt.strip()
+                else:
+                    fname = (payload.get("file_name") or "").strip()
+                    user_text = f"<media:audio> ({fname})" if fname else "<media:audio>"
+            elif mtype in ("video", "media"):
+                fname = (payload.get("file_name") or "").strip()
+                user_text = f"<media:video> ({fname})" if fname else "<media:video>"
+            elif mtype == "sticker":
+                user_text = "<media:sticker>"
+            elif mtype == "share_chat":
+                body = (payload.get("body") or "").strip() if isinstance(payload.get("body"), str) else ""
+                summary = (payload.get("summary") or "").strip() if isinstance(payload.get("summary"), str) else ""
+                share_id = payload.get("share_chat_id")
+                if body:
+                    user_text = body
+                elif summary:
+                    user_text = summary
+                elif isinstance(share_id, str) and share_id.strip():
+                    user_text = f"[Forwarded message: {share_id.strip()}]"
+                else:
+                    user_text = "[Forwarded message]"
+            elif mtype == "merge_forward":
+                user_text = "[Merged and Forwarded Message]"
             else:
                 logger.info(
                     "feishu.skip_unsupported type=%s msg_id=%s",
@@ -790,14 +1026,22 @@ class FeishuClient:
 
     @staticmethod
     def _preprocess_markdown(text: str) -> str:
-        """Feishu 旧版卡片的 markdown 元素不支持 `#` 标题和 GFM 表格：
-        标题会原样显示井号；表格整段消失。在发送前把这两类构造转成
-        它能渲染的形式（粗体 / 缩进列表）。
+        """Feishu 旧版卡片的 markdown 元素不支持 `#` 标题、GFM 表格和
+        有序列表（`1. xxx`）：标题会原样显示井号；表格整段消失；
+        有序列表的序号会被吃掉。在发送前把这三类构造转成它能渲染
+        的形式（粗体 / 缩进列表 / emoji 数字）。
         """
         lines = text.split("\n")
         out: list[str] = []
         sep_re = re.compile(r"^\s*\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)+\|?\s*$")
         header_re = re.compile(r"^(#{1,6})\s+(.*\S)\s*$")
+        ordered_re = re.compile(r"^(\s*)(\d+)\.\s+(.+)$")
+        # 飞书旧版卡片 markdown 也不支持 `> ` 引用块（整段消失）和 `- [ ]/[x]`
+        # 任务列表（方括号会原样显示），同样在发送前转成它能渲染的形式。
+        blockquote_re = re.compile(r"^(\s*)>\s?(.*)$")
+        task_re = re.compile(r"^(\s*[-*+])\s+\[( |x|X)\]\s+(.+)$")
+        emoji_digits = ["0️⃣", "1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣",
+                        "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟"]
 
         def split_row(row: str) -> list[str]:
             row = row.strip()
@@ -835,8 +1079,30 @@ class FeishuClient:
             m = header_re.match(line)
             if m:
                 out.append(f"**{m.group(2).strip()}**")
-            else:
-                out.append(line)
+                i += 1
+                continue
+            m = ordered_re.match(line)
+            if m:
+                indent, num_str, body = m.groups()
+                n = int(num_str)
+                prefix = emoji_digits[n] if 1 <= n <= 10 else f"**{n}.**"
+                out.append(f"{indent}{prefix} {body}")
+                i += 1
+                continue
+            m = task_re.match(line)
+            if m:
+                bullet, mark, body = m.groups()
+                checked = mark.lower() == "x"
+                out.append(f"{bullet} {'☑' if checked else '☐'} {body}")
+                i += 1
+                continue
+            m = blockquote_re.match(line)
+            if m:
+                indent, body = m.groups()
+                out.append(f"{indent}▌ {body}" if body else f"{indent}▌")
+                i += 1
+                continue
+            out.append(line)
             i += 1
         return "\n".join(out)
 

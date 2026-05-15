@@ -1653,23 +1653,34 @@ _CMD_TIMEOUT = 120  # seconds
 _CMD_MAX_OUTPUT = 20_000  # chars returned to model
 
 
-_BG_AMP_RE = re.compile(r"&\s*(?:$|[;\n])")
+_BG_AMP_RE = re.compile(r"&\s*(?:$|[;\n]|disown\b)")
 
 
 def _has_bare_background_amp(cmd: str) -> bool:
-    """Detect a bare `&` used to background a command.
+    """Detect a bare `&` used to background a command, including
+    `... & disown` which is equally dangerous unless stdout is redirected.
 
     Trap: `subprocess.run(capture_output=True)` with a backgrounded
     child means the grandchild inherits the stdout/stderr pipe. The
     parent's `communicate()` blocks until the grandchild closes its
-    fds — i.e. forever for a long-lived `python -m http.server &`.
-    The model has hit this twice in one night, so we reject at the
-    tool layer instead of relying on outer timeouts.
+    fds — i.e. forever for a long-lived `python -m http.server &` or
+    `nohup python -m http.server & disown` without redirection. The model
+    has hit this twice in one night, so we reject at the tool layer
+    instead of relying on outer timeouts.
+
+    Safe form (放行): include explicit stdout redirection — `>` or `>>` to
+    a file/null — which detaches the inherited PIPE fd. E.g.
+    `nohup CMD >/tmp/svc.log 2>&1 </dev/null & disown` is OK.
     """
     cleaned = cmd
     for noise in ("&&", "||", "2>&1", "1>&2", ">&", "|&"):
         cleaned = cleaned.replace(noise, " ")
-    return bool(_BG_AMP_RE.search(cleaned))
+    if not _BG_AMP_RE.search(cleaned):
+        return False
+    # Allow if stdout is redirected to a file/null (`>` or `>>`).
+    if ">" in cleaned:
+        return False
+    return True
 
 
 def make_run_command_tool() -> Tool:
