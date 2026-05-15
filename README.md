@@ -3,7 +3,7 @@
 > 轻量化的 [OpenClaw](https://github.com/openclaw/openclaw) —— 一个跑在飞书里的个人 AI 助手，原生接 **Claude Opus 4.7**。
 > Single Python process · 飞书长连接 · SQLite 持久化 · 可选向量记忆。
 
-**v0.2.0** · [MIT License](./LICENSE)
+**v0.2.1** · [MIT License](./LICENSE)
 
 ---
 
@@ -19,6 +19,13 @@ XiaoNZ Agent 是一个长期运行的个人 Agent。它：
 跟完整版 OpenClaw 的区别：**不分布式、不多租户、不容器化**——一台机器一个用户一个进程，简单粗暴，核心代码 ~3k 行能看完。
 
 ---
+
+## v0.2.1 更新一览
+
+- **飞书消息类型全覆盖** — `post`（富文本，@/加粗/链接 会让飞书把 text 升级成 post 类型）、`audio`（优先用 `speech_to_text`）、`sticker` / `video` / `share_chat` / `merge_forward` 全部进 agent loop，不再静默 skip。参考 [OpenClaw](https://github.com/openclaw/openclaw) `extensions/feishu/src/bot-content.ts` 的 `parseMessageContent` / `parsePostContent` 实现
+- **卡片 markdown 扩展** — `_preprocess_markdown` 新增 `> blockquote` → `▌` 和 `- [ ] / - [x]` 任务列表 → `☐ / ☑` 转换，飞书旧版卡片不再丢这两种构造（之前只处理 `#` 标题、GFM 表格、有序列表）
+- **空闲心跳** — 进程内 watchdog 每 5min 主动写一行 `xiaonz.alive`，刷 `agent.log` mtime；避免外部 launchd heartbeat 把"长时间没用户消息"的空闲进程误判为卡死并重启
+- **`run_command` 拦截升级** — 现在也拦 `... & disown` 没有 stdout 重定向的模式（之前只拦裸 `&`），grandchild 继承 PIPE 后 `communicate()` 卡死的洞补齐；带 `>` / `>>` 显式重定向的安全形式（`nohup CMD >/tmp/svc.log 2>&1 </dev/null & disown`）仍然放行
 
 ## v0.2.0 更新一览
 
@@ -202,6 +209,9 @@ v0.2.0 重点加固了几个容易翻车的点：
 | bge-m3 单 worker 被并发打 503 | 共享 client + Semaphore(1) 串行化 + 指数退避重试 |
 | macOS 系统代理（ClashX）劫持 localhost | Embedder `trust_env=False` 强制绕开 |
 | 异常直接拼 repr 抛回飞书 | `_friendly_error_text` 按类型映射成人话 |
+| 飞书 post 富文本 / 语音 / 转发等被静默 skip | 全消息类型解析，照 [OpenClaw](https://github.com/openclaw/openclaw) 实现对齐 |
+| heartbeat 把空闲进程误判卡死重启 | 进程内 watchdog 每 5min 主动写 `xiaonz.alive` 心跳日志 |
+| `& disown` 不带 stdout 重定向卡 `communicate()` | `_has_bare_background_amp` 拦截 + 错误提示给安全形式 |
 
 ---
 
