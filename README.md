@@ -121,12 +121,16 @@ python -m src.main
 
 > embedding 写入由后台 cron 回填，请求路径只读不写，bge-m3 抖动不会拖慢回复。
 
-### 方案 A：Ollama（推荐）
+### 方案 A：Docker + TEI（推荐）
+
+[HuggingFace text-embeddings-inference](https://github.com/huggingface/text-embeddings-inference) 专门做 embedding 推理，动态 batching，batch 任务比 Ollama 快 5~10x。
 
 ```bash
-brew install ollama         # 或 https://ollama.com/download
-ollama pull bge-m3          # ~1.2GB
-ollama serve                # 起服务在 :11434
+docker run -d --name tei-bge-m3 \
+  -p 11434:80 \
+  -v ~/.cache/huggingface:/data \
+  ghcr.io/huggingface/text-embeddings-inference:cpu-latest \
+  --model-id BAAI/bge-m3
 ```
 
 ```yaml
@@ -137,9 +141,17 @@ embedding:
   dim: 1024
 ```
 
-### 方案 B：HuggingFace TEI 自部署
+### 方案 B：Ollama（无 Docker 时）
 
-[BAAI/bge-m3](https://huggingface.co/BAAI/bge-m3) 用 [text-embeddings-inference](https://github.com/huggingface/text-embeddings-inference) 起服务后填 `base_url`。
+`brew install ollama` 一行装好，原生 macOS app，但单 worker 无 batching，bulk embed 慢。
+
+```bash
+brew install ollama         # 或 https://ollama.com/download
+ollama pull bge-m3          # ~1.2GB
+ollama serve                # 起服务在 :11434
+```
+
+`config.yaml` 同方案 A。
 
 ### 方案 C：OpenAI 官方 embeddings
 
