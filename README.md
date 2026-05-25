@@ -121,7 +121,7 @@ python -m src.main
 
 > embedding 写入由后台 cron 回填，请求路径只读不写，bge-m3 抖动不会拖慢回复。
 
-### 方案 A：Docker + TEI（推荐）
+### 方案 A：TEI（推荐）
 
 [HuggingFace text-embeddings-inference](https://github.com/huggingface/text-embeddings-inference) 专门做 embedding 推理，动态 batching，batch 任务比 Ollama 快 5~10x。
 
