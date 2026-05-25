@@ -27,16 +27,23 @@ logger = logging.getLogger(__name__)
 class ModelClient:
     def __init__(self, settings: Settings):
         self.settings = settings
+        # trust_env=False 强制不读 HTTP(S)_PROXY 和 macOS 系统代理设置——
+        # httpx client 创建时一次性快照代理配置，运行中代理软件挂掉/系统代理改了
+        # 它都不会重读，会持续把请求发往一个不存在的代理端口直到进程重启。
+        # 内网网关直连，不需要走代理。
         self._client = AsyncAnthropic(
             base_url=settings.model.base_url,
             auth_token=settings.model.auth_token,
-            timeout=httpx.Timeout(
-                connect=settings.model.connect_timeout,
-                read=settings.model.read_timeout,
-                write=10.0,
-                pool=10.0,
-            ),
             max_retries=settings.model.max_retries,
+            http_client=httpx.AsyncClient(
+                trust_env=False,
+                timeout=httpx.Timeout(
+                    connect=settings.model.connect_timeout,
+                    read=settings.model.read_timeout,
+                    write=10.0,
+                    pool=10.0,
+                ),
+            ),
         )
 
     async def create_message(
