@@ -356,6 +356,20 @@ class FeishuClient:
         self._inflight_by_session: dict[str, set[str]] = {}
         self._inflight_lock = threading.Lock()
 
+        # Per-session turn serialization. Feishu delivers a multi-image
+        # send as several separate messages ~0.3s apart, so each spawns
+        # its own `_run_turn` coroutine. Without serialization they race
+        # on the same session's message log: turn B loads a history
+        # snapshot that already contains turn A's assistant reply, the
+        # role-alternation collapse in `get_messages` leaves an assistant
+        # message last, and the API rejects it with "the conversation
+        # must end with a user message" — so the image turn silently
+        # fails. These locks force same-session turns to run one at a
+        # time. Created lazily on the agent loop (asyncio.Lock binds to
+        # the running loop), only ever touched from that single loop, so
+        # no extra mutex is needed. Keyed by session_id.
+        self._session_turn_locks: dict[str, asyncio.Lock] = {}
+
         # ── Watchdog state ────────────────────────────────────────────
         # 2026-05-12 历史教训：lark sdk 在 ws 长跑后会进入"软僵尸"——
         # ws 反复重连还在打 "Lark connected"，但 _on_message 永不触发，
@@ -707,14 +721,23 @@ class FeishuClient:
                     user_text = f"{user_text}\n\n（图片下载失败）"
 
             # 3. Run the agent. This is the part that can take a while
-            #    and is cancellable via task.cancel().
-            reply = await self.agent.handle_user_message(
-                session_id=session_id,
-                source=source,
-                peer_id=peer_id,
-                user_text=user_text,
-                attachments=attachments or None,
-            )
+            #    and is cancellable via task.cancel(). Serialize per
+            #    session so concurrent turns (e.g. a multi-image send)
+            #    don't interleave appends to the same message log and
+            #    corrupt role alternation. Attachment download above is
+            #    left outside the lock so it still parallelizes.
+            turn_lock = self._session_turn_locks.get(session_id)
+            if turn_lock is None:
+                turn_lock = asyncio.Lock()
+                self._session_turn_locks[session_id] = turn_lock
+            async with turn_lock:
+                reply = await self.agent.handle_user_message(
+                    session_id=session_id,
+                    source=source,
+                    peer_id=peer_id,
+                    user_text=user_text,
+                    attachments=attachments or None,
+                )
 
             # 4. Patch the placeholder card with the final markdown reply.
             await self._deliver_reply(

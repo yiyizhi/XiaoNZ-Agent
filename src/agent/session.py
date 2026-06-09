@@ -157,6 +157,17 @@ class SessionStore:
         if normalized and normalized[0]["role"] != "user":
             normalized = normalized[1:]
 
+        # ...and the conversation must END with a user message. The
+        # caller always appends the current user turn before loading, so
+        # in the normal path the tail is already 'user'. This guards the
+        # edge where a concurrent same-session turn slipped an assistant
+        # reply in after it — without this the API rejects the request
+        # ("conversation must end with a user message"). Per-session turn
+        # serialization in the Feishu client prevents the race; this is a
+        # belt-and-suspenders backstop.
+        while normalized and normalized[-1]["role"] != "user":
+            normalized.pop()
+
         return normalized
 
     def count_messages(self, session_id: str) -> int:
