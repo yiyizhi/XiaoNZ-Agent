@@ -34,6 +34,7 @@ The main thread then calls `ws_client.start()` and blocks forever.
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import logging
 import os
@@ -965,62 +966,32 @@ class FeishuClient:
         """Download a Feishu image and produce an Anthropic vision
         content block. Returns None on failure.
 
-        NOTE: Some upstream proxies reject `source.type == base64`
-        images and ONLY accept `source.type == url` with an HTTPS URL.
-        To stay compatible we always stage Feishu images through a
-        public anonymous image bed (tmpfiles.org, 60-min retention)
-        and pass that URL to the model. If your endpoint accepts
-        base64 directly you can simplify and drop the upload step.
+        We inline the image as `source.type == base64`, which the
+        Anthropic Messages API (and our self-hosted gateway) accepts
+        natively. We deliberately do NOT route through a public image
+        bed: tmpfiles.org is Cloudflare-fronted and GFW-blocked from
+        this host (TLS reset on direct connect), and the system proxy
+        is intermittent — so the upload step was the actual reason
+        images "never arrived". base64 has no external dependency.
         """
         data = await loop.run_in_executor(
             None, self._download_resource, message_id, image_key, "image"
         )
         if data is None:
             return None
-        url = await loop.run_in_executor(None, self._upload_image_bed, data)
-        if url is None:
-            return None
-        return {"type": "image", "source": {"type": "url", "url": url}}
-
-    def _upload_image_bed(self, data: bytes) -> str | None:
-        """POST bytes to tmpfiles.org and return an HTTPS direct URL.
-
-        tmpfiles returns `http://tmpfiles.org/<id>/<name>` which both
-        (a) is HTTP and (b) serves an HTML preview page. We rewrite
-        to `https://tmpfiles.org/dl/<id>/<name>` which serves the raw
-        file over HTTPS — the form most Anthropic-compatible upstreams
-        require for `source.type == url`.
-        """
         media_type = _guess_image_media_type(data)
-        ext = media_type.split("/")[-1]
-        try:
-            resp = httpx.post(
-                "https://tmpfiles.org/api/v1/upload",
-                files={"file": (f"image.{ext}", data, media_type)},
-                timeout=20.0,
-            )
-            resp.raise_for_status()
-            body = resp.json()
-        except Exception:
-            logger.exception("feishu.imgbed_upload_failed")
-            return None
-        raw_url = (body or {}).get("data", {}).get("url", "")
-        if not raw_url:
-            logger.error("feishu.imgbed_no_url body=%s", body)
-            return None
-        # http://tmpfiles.org/ID/name → https://tmpfiles.org/dl/ID/name
-        https_url = raw_url.replace("http://", "https://", 1)
-        if "tmpfiles.org/" in https_url and "/dl/" not in https_url:
-            https_url = https_url.replace(
-                "tmpfiles.org/", "tmpfiles.org/dl/", 1
-            )
+        b64 = base64.standard_b64encode(data).decode("ascii")
         logger.info(
-            "feishu.imgbed_ok bytes=%d media=%s url=%s",
-            len(data),
-            media_type,
-            https_url,
+            "feishu.image_inlined bytes=%d media=%s", len(data), media_type
         )
-        return https_url
+        return {
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": media_type,
+                "data": b64,
+            },
+        }
 
     # ── outbound (cards) ───────────────────────────────────────────
 

@@ -1076,11 +1076,7 @@ def make_generate_image_tool(settings: Any, feishu: Any) -> Tool:
         "然后停下来等用户指示。]"
     )
 
-    # Hard cap on images per single user turn. Session on 2026-04-24
-    # generated 10 images from one "继续" message (whole office render
-    # site) and spammed Feishu. Past the cap we refuse and instruct the
-    # model to ask the user for explicit go-ahead.
-    _MAX_IMAGES_PER_TURN = 5
+    # 2026-05-18: 用户改为不限制，通过 /cancel 命令手动停止。
 
     def _err(msg: str) -> str:
         logger.warning("tool.generate_image.failed reason=%s", msg)
@@ -1095,23 +1091,12 @@ def make_generate_image_tool(settings: Any, feishu: Any) -> Tool:
             )
 
         with ctx.lock:
-            if ctx.generate_image_count >= _MAX_IMAGES_PER_TURN:
-                logger.warning(
-                    "tool.generate_image.cap_hit session=%s count=%d cap=%d",
-                    ctx.session_id, ctx.generate_image_count,
-                    _MAX_IMAGES_PER_TURN,
-                )
-                return _err(
-                    f"ERROR: 这一轮已经生成过 {ctx.generate_image_count} "
-                    f"张图了，达到单轮上限 {_MAX_IMAGES_PER_TURN} 张。"
-                    f"请先把已有的图发给用户看，让用户确认是否继续生成。"
-                )
             ctx.generate_image_count += 1
             current_count = ctx.generate_image_count
 
         logger.info(
-            "tool.generate_image.progress session=%s count=%d/%d",
-            ctx.session_id, current_count, _MAX_IMAGES_PER_TURN,
+            "tool.generate_image.progress session=%s count=%d",
+            ctx.session_id, current_count,
         )
 
         try:
