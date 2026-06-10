@@ -72,6 +72,11 @@ THINKING_TEXT = "我想想…"
 MAX_FILE_BYTES = 60_000       # ≈ 30k Chinese chars, ≈ 20k tokens
 MAX_PDF_PAGES = 10            # cap long PDFs at ingest; full read via tool
 
+# Anthropic Messages API rejects images over 5 MB (decoded). Guard at
+# ingest so an oversized photo fails with a clear message instead of a
+# confusing gateway 400 mid-turn.
+MAX_IMAGE_BYTES = 5 * 1024 * 1024
+
 _UNSAFE_NAME_CHARS = re.compile(r'[/\\:*?"<>|\x00-\x1f]')
 
 
@@ -170,12 +175,18 @@ def _guess_image_media_type(data: bytes) -> str:
     return "image/png"
 
 
+# Lark @-mention placeholders look like "@_user_1". Strip them with a
+# targeted regex — splitting on whitespace and re-joining (the old
+# approach) destroyed every newline in multi-line messages.
+_MENTION_PLACEHOLDER_RE = re.compile(r"@_user_\d+[ \t]?")
+
+
 def _parse_text_content(raw: str | None) -> str:
     """Feishu text messages arrive as JSON like `{"text":"hi @_user_1"}`.
 
-    Return the plain text, stripping any @mentions we can detect. If
-    parsing fails, return the raw string so the user still sees
-    something.
+    Return the plain text, stripping any @mentions we can detect while
+    preserving line breaks. If parsing fails, return the raw string so
+    the user still sees something.
     """
     if not raw:
         return ""
@@ -186,9 +197,8 @@ def _parse_text_content(raw: str | None) -> str:
     text = data.get("text", "")
     if not isinstance(text, str):
         return ""
-    # Drop lark @-mention placeholders like "@_user_1 "
-    parts = [p for p in text.split() if not p.startswith("@_user_")]
-    return " ".join(parts).strip() or text.strip()
+    cleaned = _MENTION_PLACEHOLDER_RE.sub("", text).strip()
+    return cleaned or text.strip()
 
 
 def _str(value) -> str:
@@ -295,10 +305,34 @@ def _parse_post_content(raw: str | None) -> str:
     return "\n\n".join(s for s in (title, body) if s).strip() or "[Rich text message]"
 
 
+# lark sdk logs its full ws URL on every connect, query string included
+# — access_key / ticket / device_id all end up in agent.log. Scrub them.
+_WS_SECRET_RE = re.compile(r"(access_key|ticket|device_id)=[^&\s]+")
+
+
+class _RedactSecretsFilter(logging.Filter):
+    """Rewrite lark_oapi log records so ws credentials never reach a
+    handler. Never blocks emission — always returns True."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            msg = record.getMessage()
+            redacted = _WS_SECRET_RE.sub(r"\1=***", msg)
+            if redacted != msg:
+                record.msg = redacted
+                record.args = ()
+        except Exception:
+            pass
+        return True
+
+
 class _LarkConnectedFilter(logging.Filter):
-    """Logging filter that taps into lark_oapi's own logger to spot
-    'Lark connected ...' lines. Each match calls `client._on_lark_connected()`
-    so the FeishuClient watchdog can detect ws flapping.
+    """Logging filter on the lark sdk's logger (named "Lark", see
+    lark_oapi/core/log.py) to spot ws connect lines. The sdk logs
+    `connected to wss://... [conn_id=...]`; each match calls
+    `client._on_lark_connected()` so the FeishuClient watchdog can
+    detect ws flapping. startswith() is deliberate — the disconnect
+    line `disconnected to ...` contains the same substring.
 
     Never blocks log emission — always returns True.
     """
@@ -309,7 +343,7 @@ class _LarkConnectedFilter(logging.Filter):
 
     def filter(self, record: logging.LogRecord) -> bool:
         try:
-            if "Lark connected" in record.getMessage():
+            if record.getMessage().startswith("connected to "):
                 self._client._on_lark_connected()
         except Exception:
             pass
@@ -384,9 +418,12 @@ class FeishuClient:
         self._lark_lock = threading.Lock()
         # 注册日志过滤器：lark sdk 每次 ws 连接成功打 "Lark connected ..."
         # 抓住这条日志做 ws 健康度信号
-        logging.getLogger("lark_oapi").addFilter(
-            _LarkConnectedFilter(self)
-        )
+        # The sdk's logger is named "Lark" (lark_oapi/core/log.py) —
+        # NOT "lark_oapi". The filters were originally attached to the
+        # wrong name, which silently disabled flap detection.
+        lark_logger = logging.getLogger("Lark")
+        lark_logger.addFilter(_RedactSecretsFilter())
+        lark_logger.addFilter(_LarkConnectedFilter(self))
 
     # ── lifecycle ──────────────────────────────────────────────────
 
@@ -505,6 +542,30 @@ class FeishuClient:
                 logger.info("feishu.dedup event_id=%s", event_id)
                 return
             self.store.mark_event_processed(event_id)
+
+            # ── sender gate ────────────────────────────────────────
+            # Ignore non-user senders (other bots/apps) to prevent
+            # bot-to-bot loops, and enforce the open_id allowlist —
+            # without it anyone who can DM the bot or sits in a shared
+            # group can drive run_command on this machine.
+            sender_type = getattr(sender, "sender_type", None)
+            if sender_type and sender_type != "user":
+                logger.info(
+                    "feishu.skip_nonuser_sender type=%s msg_id=%s",
+                    sender_type, msg.message_id,
+                )
+                return
+            sender_open_id = (
+                getattr(getattr(sender, "sender_id", None), "open_id", None)
+                or ""
+            )
+            allowed = self.settings.feishu.allowed_open_ids
+            if allowed and sender_open_id not in allowed:
+                logger.warning(
+                    "feishu.sender_rejected open_id=%s chat_id=%s msg_id=%s",
+                    sender_open_id, msg.chat_id, msg.message_id,
+                )
+                return
 
             # Parse per-type payload: set user_text + file/image keys.
             user_text = ""
@@ -718,7 +779,10 @@ class FeishuClient:
                 if block is not None:
                     attachments.append(block)
                 else:
-                    user_text = f"{user_text}\n\n（图片下载失败）"
+                    user_text = (
+                        f"{user_text}\n\n（图片下载失败，"
+                        f"或超过 {MAX_IMAGE_BYTES // (1024 * 1024)} MB 识图上限）"
+                    )
 
             # 3. Run the agent. This is the part that can take a while
             #    and is cancellable via task.cancel(). Serialize per
@@ -1002,6 +1066,12 @@ class FeishuClient:
         )
         if data is None:
             return None
+        if len(data) > MAX_IMAGE_BYTES:
+            logger.warning(
+                "feishu.image_too_large bytes=%d limit=%d",
+                len(data), MAX_IMAGE_BYTES,
+            )
+            return None
         media_type = _guess_image_media_type(data)
         b64 = base64.standard_b64encode(data).decode("ascii")
         logger.info(
@@ -1045,9 +1115,21 @@ class FeishuClient:
                 row = row[:-1]
             return [c.strip() for c in row.split("|")]
 
+        # Code fences must pass through untouched — a `# comment` or
+        # `1. item` inside a fence is code, not markdown structure.
+        in_fence = False
         i = 0
         while i < len(lines):
             line = lines[i]
+            if line.lstrip().startswith(("```", "~~~")):
+                in_fence = not in_fence
+                out.append(line)
+                i += 1
+                continue
+            if in_fence:
+                out.append(line)
+                i += 1
+                continue
             if (
                 "|" in line
                 and i + 1 < len(lines)

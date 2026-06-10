@@ -9,6 +9,14 @@ feishu:
   # not require these, but they're checked if your app has them set).
   verification_token: ""
   encrypt_key: ""
+  # Sender allowlist (STRONGLY recommended). Only messages from these
+  # open_ids are processed, in both p2p and group chats. Empty list =
+  # everyone — anyone who can DM the bot or share a group with it can
+  # then drive run_command on this machine. Find your open_id in
+  # agent.log: `feishu.recv chat_type=p2p peer=ou_...` (p2p peer = your
+  # open_id), or from a rejected sender's `feishu.sender_rejected` line.
+  allowed_open_ids: []
+  #  - "ou_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
 
 model:
   # Any Anthropic-compatible Messages API endpoint:

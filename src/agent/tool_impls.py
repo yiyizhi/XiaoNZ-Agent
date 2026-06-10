@@ -784,6 +784,14 @@ def _sync_download_to_disk(url: str, save_path: str | None) -> str:
                 ctype = (resp.headers.get("content-type") or "").strip()
                 target = _resolve_save_path(save_path, str(resp.url), ctype)
                 target.parent.mkdir(parents=True, exist_ok=True)
+                # Never clobber an existing file (this often lands in
+                # ~/Downloads next to the user's own files).
+                if target.exists():
+                    stem, suffix = target.stem, target.suffix
+                    n = 1
+                    while target.exists() and n < 1000:
+                        target = target.with_name(f"{stem}_{n}{suffix}")
+                        n += 1
                 total = 0
                 with target.open("wb") as out:
                     for chunk in resp.iter_bytes():
@@ -1690,37 +1698,79 @@ def make_run_command_tool() -> Tool:
         logger.info("tool.run_command cmd=%s cwd=%s", command[:200], cwd)
 
         def _run() -> str:
+            # The command gets its own process group (start_new_session)
+            # so the timeout path can killpg the WHOLE tree. With plain
+            # subprocess.run, a grandchild holding the stdout pipe makes
+            # the post-kill communicate() block forever and permanently
+            # leaks an executor thread (the 2026-04-30 incident class).
+            import os as _os
+            import signal as _signal
+
             try:
-                result = subprocess.run(
+                proc = subprocess.Popen(
                     command,
                     shell=True,
-                    capture_output=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
                     text=True,
-                    timeout=_CMD_TIMEOUT,
                     cwd=cwd,
+                    start_new_session=True,
                     env={
-                        **__import__("os").environ,
+                        **_os.environ,
                         "PYTHONPATH": str(Path(__file__).resolve().parent.parent.parent),
                     },
                 )
-            except subprocess.TimeoutExpired:
-                return f"ERROR: 命令超时（{_CMD_TIMEOUT} 秒限制）"
             except Exception as e:
                 return f"ERROR: {type(e).__name__}: {e}"
 
+            def _kill_group() -> None:
+                try:
+                    _os.killpg(proc.pid, _signal.SIGKILL)
+                except (ProcessLookupError, PermissionError, OSError):
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+
+            timed_out = False
+            stdout, stderr = "", ""
+            try:
+                stdout, stderr = proc.communicate(timeout=_CMD_TIMEOUT)
+            except subprocess.TimeoutExpired:
+                timed_out = True
+                _kill_group()
+                try:
+                    stdout, stderr = proc.communicate(timeout=5)
+                except Exception:
+                    # Pipes still held open by something outside the
+                    # group — close them and give up rather than hang.
+                    for stream in (proc.stdout, proc.stderr):
+                        try:
+                            stream.close()
+                        except Exception:
+                            pass
+            except Exception as e:
+                _kill_group()
+                return f"ERROR: {type(e).__name__}: {e}"
+
             parts: list[str] = []
-            if result.stdout:
-                out = result.stdout
+            if stdout:
+                out = stdout
                 if len(out) > _CMD_MAX_OUTPUT:
-                    out = out[:_CMD_MAX_OUTPUT] + f"\n... (已截断，共 {len(result.stdout)} 字符)"
+                    out = out[:_CMD_MAX_OUTPUT] + f"\n... (已截断，共 {len(stdout)} 字符)"
                 parts.append(out)
-            if result.stderr:
-                err = result.stderr
+            if stderr:
+                err = stderr
                 if len(err) > _CMD_MAX_OUTPUT:
                     err = err[:_CMD_MAX_OUTPUT] + "\n... (stderr 已截断)"
                 parts.append(f"STDERR:\n{err}")
-            if result.returncode != 0:
-                parts.append(f"EXIT CODE: {result.returncode}")
+            if timed_out:
+                parts.append(
+                    f"ERROR: 命令超时（{_CMD_TIMEOUT} 秒限制），"
+                    "整个进程组已被强制终止。以上是超时前捕获的输出。"
+                )
+            elif proc.returncode != 0:
+                parts.append(f"EXIT CODE: {proc.returncode}")
             return "\n".join(parts) if parts else "(no output)"
 
         return await asyncio.to_thread(_run)
@@ -1959,9 +2009,19 @@ def make_filesystem_tools() -> list[Tool]:
         p = Path(raw).expanduser()
         if not p.exists():
             return f"ERROR: 路径不存在：{p}"
-        # Safety: refuse to delete home, root, or top-level system dirs
+        # Safety: refuse to delete home, root, top-level system dirs,
+        # or the agent's own project/data (self-destruct protection —
+        # losing hermes_state.db means losing all conversation memory).
         resolved = p.resolve()
-        dangerous = {Path.home().resolve(), Path("/").resolve()}
+        project_root = Path(__file__).resolve().parent.parent.parent
+        dangerous = {
+            Path.home().resolve(),
+            Path("/").resolve(),
+            project_root,
+            project_root / "data",
+            project_root / "data" / "memory",
+            project_root / "data" / "hermes_state.db",
+        }
         if resolved in dangerous or len(resolved.parts) <= 2:
             return f"ERROR: 拒绝删除系统关键路径：{resolved}"
         was_dir = p.is_dir()
@@ -2104,6 +2164,10 @@ def make_search_memory_tool(memory: MemoryStore, db_path: Path) -> Tool:
     """Tool for the agent to search daily digests and memory backups."""
     from .session import SessionStore
 
+    # One store for the tool's lifetime — instantiating per call re-ran
+    # the schema script on every invocation.
+    store = SessionStore(db_path)
+
     async def handler(input_data: dict) -> str:
         action = (input_data.get("action") or "").strip()
 
@@ -2111,9 +2175,6 @@ def make_search_memory_tool(memory: MemoryStore, db_path: Path) -> Tool:
             keyword = (input_data.get("keyword") or "").strip()
             if not keyword:
                 return "ERROR: 'keyword' is required for search_digests."
-            if not db_path.is_file():
-                return "没有找到数据库文件。"
-            store = SessionStore(db_path)
             results = store.search_daily_digests(keyword)
             if not results:
                 return f"没有找到包含「{keyword}」的每日摘要。"
@@ -2123,9 +2184,6 @@ def make_search_memory_tool(memory: MemoryStore, db_path: Path) -> Tool:
             return "\n\n".join(lines)
 
         if action == "list_digests":
-            if not db_path.is_file():
-                return "没有找到数据库文件。"
-            store = SessionStore(db_path)
             limit = int(input_data.get("limit", 30))
             digests = store.list_daily_digests(limit=limit)
             if not digests:
@@ -2139,9 +2197,6 @@ def make_search_memory_tool(memory: MemoryStore, db_path: Path) -> Tool:
             date_str = (input_data.get("date") or "").strip()
             if not date_str:
                 return "ERROR: 'date' is required (格式 YYYY-MM-DD)."
-            if not db_path.is_file():
-                return "没有找到数据库文件。"
-            store = SessionStore(db_path)
             text = store.get_daily_digest(date_str)
             return text if text else f"没有 {date_str} 的每日摘要。"
 

@@ -14,8 +14,8 @@ thread for the Agent's own asyncio loop.
 from __future__ import annotations
 
 import logging
+import os
 import signal
-import sys
 
 from . import config
 from .agent.commands import CommandHandler
@@ -42,7 +42,8 @@ def _setup_logging() -> None:
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
     # Quiet down lark's extremely chatty debug logs if any sneak in
-    logging.getLogger("lark_oapi").setLevel(logging.INFO)
+    # (the sdk's logger is named "Lark", see lark_oapi/core/log.py)
+    logging.getLogger("Lark").setLevel(logging.INFO)
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("httpcore").setLevel(logging.WARNING)
     logging.getLogger("websockets").setLevel(logging.WARNING)
@@ -109,11 +110,16 @@ def main() -> int:
         agent.register_tool(make_search_memory_semantic_tool(vector_memory))
         log.info("xiaonz.tool.search_memory_semantic registered")
 
-    # Graceful shutdown on SIGINT/SIGTERM — lark.ws.Client.start()
-    # handles KeyboardInterrupt internally; we just want a clean log.
+    # Hard exit on SIGINT/SIGTERM. sys.exit() here used to start a
+    # "graceful" teardown that hung mid tool-loop ("cannot schedule new
+    # futures after shutdown") and left a zombie holding the lark ws
+    # registration — the 2026-05-12 软僵尸 incident. State is SQLite/WAL
+    # (crash-safe) and launchd KeepAlive restarts us, so a hard exit is
+    # the safe option.
     def _handle_signal(signum, _frame):  # noqa: ANN001
         log.info("xiaonz.shutdown signal=%s", signum)
-        sys.exit(0)
+        logging.shutdown()
+        os._exit(0)
 
     signal.signal(signal.SIGINT, _handle_signal)
     signal.signal(signal.SIGTERM, _handle_signal)

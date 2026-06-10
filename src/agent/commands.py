@@ -33,6 +33,13 @@ HELP_TEXT = (
     "/cancel      中断当前正在处理的消息（也可直接撤回那条消息）"
 )
 
+# Only these are intercepted as commands. Anything else starting with
+# '/' (file paths like "/Users/xbg/…", typos, etc.) falls through to
+# the LLM instead of dead-ending at "未知命令".
+KNOWN_COMMANDS = frozenset(
+    {"/help", "/new", "/reset", "/mem", "/skills", "/cancel"}
+)
+
 
 # `session_id → number of tasks cancelled`. Injected by main.py after
 # the FeishuClient is built, to avoid a circular import.
@@ -55,7 +62,10 @@ class CommandHandler:
         self._cancel_cb = cb
 
     def is_command(self, text: str) -> bool:
-        return text.startswith("/")
+        if not text.startswith("/"):
+            return False
+        head = text.strip().split(maxsplit=1)[0].lower()
+        return head in KNOWN_COMMANDS
 
     def handle(self, session_id: str, text: str) -> str:
         # Split into command + rest (rest currently unused but kept

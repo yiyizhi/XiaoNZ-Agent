@@ -15,6 +15,12 @@ from pydantic import BaseModel, Field
 class FeishuConfig(BaseModel):
     app_id: str
     app_secret: str
+    # Sender allowlist. When non-empty, only messages whose sender
+    # open_id is in this list are processed (applies to BOTH p2p and
+    # group chats). Empty = allow everyone — anyone who can DM the bot
+    # or share a group with it can drive run_command on this machine,
+    # so keep it set.
+    allowed_open_ids: list[str] = Field(default_factory=list)
 
 
 class ModelConfig(BaseModel):

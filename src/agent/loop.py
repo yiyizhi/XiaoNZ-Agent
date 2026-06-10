@@ -56,6 +56,14 @@ _REPEAT_HARD = 4
 _TOOL_HARD_TIMEOUT = 180
 
 
+def _log_background_task_failure(task: "asyncio.Task[Any]") -> None:
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is not None:
+        logger.error("loop.background_task_failed", exc_info=exc)
+
+
 def _tool_signature(name: str, payload: Any) -> str:
     try:
         s = json.dumps(payload, sort_keys=True, ensure_ascii=False, default=str)
@@ -388,7 +396,12 @@ class AgentLoop:
         # touches the embedder. See ai.xiaonz.embed-daily.plist.
 
         # Generate yesterday's daily digest if we haven't already today.
-        await self._maybe_generate_daily_digest()
+        # Fire-and-forget: summarizing a full day's transcript is an LLM
+        # round-trip that the first message of the day shouldn't wait on.
+        # The check-and-set guard inside runs before any await, so two
+        # concurrent turns can't both start a digest.
+        digest_task = asyncio.create_task(self._maybe_generate_daily_digest())
+        digest_task.add_done_callback(_log_background_task_failure)
 
         # Compress old turns into the rolling summary if the session
         # has grown past the threshold. Done BEFORE loading history so

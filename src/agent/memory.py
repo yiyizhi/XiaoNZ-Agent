@@ -93,7 +93,16 @@ class MemoryStore:
         )]
 
     def read_backup(self, filename: str) -> str | None:
-        """Read a specific backup by filename."""
+        """Read a specific backup by filename. Only bare `MEMORY-*.md`
+        names (as returned by list_backups) are accepted — path
+        components would otherwise let a crafted filename read
+        arbitrary files outside the archive dir."""
+        if (
+            Path(filename).name != filename
+            or not filename.startswith("MEMORY-")
+            or not filename.endswith(".md")
+        ):
+            return None
         p = self._archive_dir / filename
         if not p.is_file():
             return None
