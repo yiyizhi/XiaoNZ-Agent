@@ -49,8 +49,23 @@ def _setup_logging() -> None:
     logging.getLogger("websockets").setLevel(logging.WARNING)
 
 
+def _bypass_proxy_for_internal_hosts() -> None:
+    """飞书域名和模型网关一律直连，不走代理。
+
+    Lark SDK 底层 requests 会读 macOS 系统代理（Clash 等，端口随代理
+    App 变），代理 App 一挂 ws 重连就全军覆没——2026-06-11 凌晨小宁子
+    半小时收不到消息就是这个根因。no_proxy 只豁免这些主机，进程里其他
+    出网流量（搜索/网页抓取）不受影响。
+    """
+    bypass = "feishu.cn,larksuite.com,163.7.10.192,127.0.0.1,localhost"
+    for var in ("NO_PROXY", "no_proxy"):
+        existing = os.environ.get(var, "")
+        os.environ[var] = f"{existing},{bypass}".strip(",") if existing else bypass
+
+
 def main() -> int:
     _setup_logging()
+    _bypass_proxy_for_internal_hosts()
     log = logging.getLogger("xiaonz.main")
 
     settings = config.load()

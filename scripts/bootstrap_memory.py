@@ -300,7 +300,17 @@ async def main():
         dim=settings.embedding.dim,
         timeout=60.0,
     )
-    ok = await embedder.ping()
+    # 凌晨定时跑的时候 embedding 容器可能正在重启/冷加载模型
+    # （2026-06-11 03:15 就这么静默失败过一晚），多等几轮再放弃。
+    ok = False
+    for attempt in range(5):
+        ok = await embedder.ping()
+        if ok:
+            break
+        log.warning(
+            "embedder.ping_failed attempt=%d/5, retry in 60s", attempt + 1
+        )
+        await asyncio.sleep(60)
     if not ok:
         log.error(
             "embedder.unreachable url=%s/embeddings — start your "

@@ -77,7 +77,15 @@ class CommandHandler:
             return HELP_TEXT
 
         if cmd in ("/new", "/reset"):
+            # 先取消在途 turn 再清空：否则锁内还在跑的压缩/回复会在
+            # "已清空"之后把旧 summary 或旧回复写回来，reset 静默失效。
+            cancelled = self._cancel_cb(session_id) if self._cancel_cb else 0
             n = self.store.reset_session(session_id)
+            if cancelled:
+                return (
+                    f"已中断 {cancelled} 个正在处理的请求，"
+                    f"并开始新对话（清空了 {n} 条历史消息）。"
+                )
             return f"已开始新对话（清空了 {n} 条历史消息）。"
 
         if cmd == "/mem":

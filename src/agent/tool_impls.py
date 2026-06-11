@@ -124,10 +124,12 @@ def make_install_skill_tool(skills: SkillStore) -> Tool:
         skill_dir.mkdir(parents=True, exist_ok=True)
         skill_file = skill_dir / "SKILL.md"
         skill_file.write_text(content, encoding="utf-8")
-        # Verify it parses
-        s = skills.get(safe_name)
-        if s is None:
-            return f"WARNING: 文件已写入 {skill_file}，但解析失败，请检查 frontmatter 格式。"
+        # Verify by loading the directory we just wrote — frontmatter
+        # `name:` may legitimately differ from the sanitized dir name,
+        # and `skills.get()` matches frontmatter, causing false WARNINGs.
+        s = skills._load_one(skill_dir)
+        if s is None or not s.description:
+            return f"WARNING: 文件已写入 {skill_file}，但解析失败或缺 description，请检查 frontmatter 格式。"
         return f"OK: 技能 '{s.name}' 已安装。描述：{s.description}"
 
     return Tool(
@@ -256,16 +258,28 @@ def _sync_web_fetch(url: str) -> str:
             follow_redirects=True,
             headers={"User-Agent": _BROWSER_UA, "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8"},
         ) as c:
-            resp = c.get(url)
+            # 流式读并在 _FETCH_MAX_BYTES 处停下：非流式会先把整个
+            # body 拉进内存，慢速滴流的服务器还能把传输拖过 20s。
+            with c.stream("GET", url) as resp:
+                chunks: list = []
+                got = 0
+                for chunk in resp.iter_bytes():
+                    chunks.append(chunk)
+                    got += len(chunk)
+                    if got >= _FETCH_MAX_BYTES:
+                        break
+                status_code = resp.status_code
+                encoding = resp.encoding
+                final_url = str(resp.url)
+                ctype = (resp.headers.get("content-type") or "").split(";")[0].strip().lower()
     except httpx.HTTPError as e:
         return f"ERROR: failed to fetch {url}: {type(e).__name__}: {e}"
 
-    ctype = (resp.headers.get("content-type") or "").split(";")[0].strip().lower()
-    body = resp.content[:_FETCH_MAX_BYTES]
+    body = b"".join(chunks)[:_FETCH_MAX_BYTES]
 
     if ctype.startswith("text/html") or ctype.startswith("application/xhtml"):
         try:
-            text = body.decode(resp.encoding or "utf-8", errors="replace")
+            text = body.decode(encoding or "utf-8", errors="replace")
         except LookupError:
             text = body.decode("utf-8", errors="replace")
         h = html2text.HTML2Text()
@@ -280,13 +294,13 @@ def _sync_web_fetch(url: str) -> str:
         or ctype.startswith("application/yaml")
     ):
         try:
-            out = body.decode(resp.encoding or "utf-8", errors="replace")
+            out = body.decode(encoding or "utf-8", errors="replace")
         except LookupError:
             out = body.decode("utf-8", errors="replace")
     else:
         return (
-            f"HTTP {resp.status_code} {ctype or '(unknown)'} "
-            f"bytes={len(resp.content)}\n\n"
+            f"HTTP {status_code} {ctype or '(unknown)'} "
+            f"bytes={got}\n\n"
             f"ERROR: 不支持的 content-type（只支持 text/* 和 application/json|xml|yaml）。"
         )
 
@@ -296,7 +310,7 @@ def _sync_web_fetch(url: str) -> str:
         truncated = f"\n\n... (已截断，原文超过 {_FETCH_MAX_OUT_CHARS} 字符)"
 
     return (
-        f"HTTP {resp.status_code} {ctype} final_url={str(resp.url)}\n\n"
+        f"HTTP {status_code} {ctype} final_url={final_url}\n\n"
         f"{out}{truncated}"
     )
 
@@ -1108,6 +1122,9 @@ def make_generate_image_tool(settings: Any, feishu: Any) -> Tool:
         )
 
         try:
+            # trust_env=False 与 model_client/embedder 一致：内网网关
+            # 不能被系统代理劫持。超时压到 150s，留在 loop 的 180s 硬超时
+            # 之内，否则图会在模型已被告知"失败"之后才发出去。
             resp = httpx.post(
                 f"{base_url}/v1/images/generations",
                 headers={
@@ -1120,7 +1137,8 @@ def make_generate_image_tool(settings: Any, feishu: Any) -> Tool:
                     "n": 1,
                     "size": size,
                 },
-                timeout=180.0,
+                timeout=150.0,
+                trust_env=False,
             )
         except httpx.HTTPError as e:
             return _err(f"ERROR: 生图请求失败 {type(e).__name__}: {e}")
@@ -1285,22 +1303,28 @@ def make_read_pdf_tool() -> Tool:
             import pymupdf
         except ImportError:
             return "ERROR: pymupdf 未安装，无法读取 PDF。"
-        try:
-            doc = pymupdf.open(str(p))
-            pages: list[str] = []
-            for i, page in enumerate(doc):
-                text = page.get_text().strip()
-                if text:
-                    pages.append(f"## 第 {i + 1} 页\n\n{text}")
-            doc.close()
-        except Exception as e:
-            return f"ERROR: PDF 解析失败：{e}"
-        if not pages:
-            return f"PDF 没有可提取的文字（可能是扫描件/纯图片 PDF）。"
-        full = "\n\n".join(pages)
-        if len(full) > _PDF_MAX_CHARS:
-            full = full[:_PDF_MAX_CHARS] + f"\n\n... (已截断，原文 {len(full)} 字符)"
-        return full
+
+        # 解析是纯同步 CPU/IO，大 PDF 会把 agent loop 堵死（连 180s
+        # 硬超时都没法触发），必须挪到线程里。
+        def _sync_extract() -> str:
+            try:
+                doc = pymupdf.open(str(p))
+                pages: list[str] = []
+                for i, page in enumerate(doc):
+                    text = page.get_text().strip()
+                    if text:
+                        pages.append(f"## 第 {i + 1} 页\n\n{text}")
+                doc.close()
+            except Exception as e:
+                return f"ERROR: PDF 解析失败：{e}"
+            if not pages:
+                return f"PDF 没有可提取的文字（可能是扫描件/纯图片 PDF）。"
+            full = "\n\n".join(pages)
+            if len(full) > _PDF_MAX_CHARS:
+                full = full[:_PDF_MAX_CHARS] + f"\n\n... (已截断，原文 {len(full)} 字符)"
+            return full
+
+        return await asyncio.to_thread(_sync_extract)
 
     return Tool(
         name="read_pdf",
@@ -1336,7 +1360,7 @@ import subprocess
 _TOMD_BIN = shutil.which("tomd") or str(Path.home() / ".local/bin/tomd")
 
 _TOMD_MAX_CHARS = 60_000
-_TOMD_TIMEOUT = 180  # seconds — office docs + PDFs can take a while
+_TOMD_TIMEOUT = 150  # seconds — 必须低于 loop 的 180s 硬超时，让工具自己报错而不是被外层抛弃
 
 _TOMD_FORCE_TYPES = {
     "webpage", "wechat", "youtube", "bilibili",
@@ -1670,10 +1694,14 @@ def _has_bare_background_amp(cmd: str) -> bool:
         cleaned = cleaned.replace(noise, " ")
     if not _BG_AMP_RE.search(cleaned):
         return False
-    # Allow if stdout is redirected to a file/null (`>` or `>>`).
-    if ">" in cleaned:
-        return False
-    return True
+    # Allow only if stdout is redirected (`>`) in the SAME `;`/newline
+    # segment as the `&` — a redirect elsewhere in the command line
+    # (e.g. `echo x > /tmp/f; python -m http.server &`) doesn't detach
+    # the backgrounded process's stdout.
+    for seg in re.split(r"[;\n]", cleaned):
+        if _BG_AMP_RE.search(seg) and ">" not in seg:
+            return True
+    return False
 
 
 def make_run_command_tool() -> Tool:
@@ -1928,17 +1956,21 @@ def make_filesystem_tools() -> list[Tool]:
         # If destination is an existing directory, move INTO it
         if dp.is_dir():
             dp = dp / sp.name
-        try:
-            dp.parent.mkdir(parents=True, exist_ok=True)
-            sp.rename(dp)
-        except OSError as e:
-            # rename fails across filesystems; fall back to shutil
-            import shutil
+        def _sync_move() -> str:
             try:
-                shutil.move(str(sp), str(dp))
-            except Exception as e2:
-                return f"ERROR: {e2}"
-        return f"OK: {sp.name} → {dp}"
+                dp.parent.mkdir(parents=True, exist_ok=True)
+                sp.rename(dp)
+            except OSError:
+                # rename fails across filesystems; fall back to shutil
+                import shutil
+                try:
+                    shutil.move(str(sp), str(dp))
+                except Exception as e2:
+                    return f"ERROR: {e2}"
+            return f"OK: {sp.name} → {dp}"
+
+        # 跨盘移动是整文件拷贝，不能堵 agent loop
+        return await asyncio.to_thread(_sync_move)
 
     move_tool = Tool(
         name="move_path",
@@ -1972,15 +2004,20 @@ def make_filesystem_tools() -> list[Tool]:
         if dp.is_dir():
             dp = dp / sp.name
         import shutil
-        try:
-            dp.parent.mkdir(parents=True, exist_ok=True)
-            if sp.is_dir():
-                shutil.copytree(str(sp), str(dp))
-            else:
-                shutil.copy2(str(sp), str(dp))
-        except Exception as e:
-            return f"ERROR: {e}"
-        return f"OK: 已复制到 {dp}"
+
+        def _sync_copy() -> str:
+            try:
+                dp.parent.mkdir(parents=True, exist_ok=True)
+                if sp.is_dir():
+                    shutil.copytree(str(sp), str(dp))
+                else:
+                    shutil.copy2(str(sp), str(dp))
+            except Exception as e:
+                return f"ERROR: {e}"
+            return f"OK: 已复制到 {dp}"
+
+        # 大目录拷贝不能堵 agent loop
+        return await asyncio.to_thread(_sync_copy)
 
     copy_tool = Tool(
         name="copy_path",
@@ -2026,15 +2063,20 @@ def make_filesystem_tools() -> list[Tool]:
             return f"ERROR: 拒绝删除系统关键路径：{resolved}"
         was_dir = p.is_dir()
         import shutil
-        try:
-            if was_dir:
-                shutil.rmtree(str(p))
-            else:
-                p.unlink()
-        except Exception as e:
-            return f"ERROR: {e}"
-        kind = "目录" if was_dir else "文件"
-        return f"OK: 已删除{kind} {p}"
+
+        def _sync_delete() -> str:
+            try:
+                if was_dir:
+                    shutil.rmtree(str(p))
+                else:
+                    p.unlink()
+            except Exception as e:
+                return f"ERROR: {e}"
+            kind = "目录" if was_dir else "文件"
+            return f"OK: 已删除{kind} {p}"
+
+        # rmtree 大目录不能堵 agent loop
+        return await asyncio.to_thread(_sync_delete)
 
     delete_tool = Tool(
         name="delete_path",
@@ -2065,22 +2107,42 @@ def make_filesystem_tools() -> list[Tool]:
         p = Path(raw).expanduser()
         if not p.is_file():
             return f"ERROR: 文件不存在：{p}"
-        try:
-            data = p.read_bytes()
-        except OSError as e:
-            return f"ERROR: {e}"
-        if b"\x00" in data[:8192]:
-            return f"ERROR: {p.name} 是二进制文件，无法以文本读取。"
-        try:
-            text = data.decode("utf-8")
-        except UnicodeDecodeError:
+        # 只读到字符上限的 4 倍字节就停（够覆盖 UTF-8 中文），
+        # 不然一个超大日志文件会被整个读进内存、还堵住 agent loop。
+        max_bytes = _READ_FILE_MAX_CHARS * 4
+
+        def _sync_read() -> str:
             try:
-                text = data.decode("gbk")
-            except UnicodeDecodeError:
+                size = p.stat().st_size
+                with p.open("rb") as f:
+                    head = f.read(8192)
+                    if b"\x00" in head:
+                        return f"ERROR: {p.name} 是二进制文件，无法以文本读取。"
+                    data = head + f.read(max(0, max_bytes - len(head)))
+            except OSError as e:
+                return f"ERROR: {e}"
+            # 截断读可能切在多字节字符中间，strict 解码会误报；
+            # 截断时允许去掉最多 3 个尾部残字节重试。
+            candidates = [data]
+            if size > max_bytes:
+                candidates += [data[:-1], data[:-2], data[:-3]]
+            text = None
+            for enc in ("utf-8", "gbk"):
+                for raw in candidates:
+                    try:
+                        text = raw.decode(enc)
+                        break
+                    except UnicodeDecodeError:
+                        continue
+                if text is not None:
+                    break
+            if text is None:
                 return f"ERROR: {p.name} 编码无法识别（不是 UTF-8 也不是 GBK）。"
-        if len(text) > _READ_FILE_MAX_CHARS:
-            text = text[:_READ_FILE_MAX_CHARS] + f"\n\n... (已截断，原文 {len(text)} 字符)"
-        return text
+            if len(text) > _READ_FILE_MAX_CHARS or size > max_bytes:
+                text = text[:_READ_FILE_MAX_CHARS] + f"\n\n... (已截断，文件共 {size} 字节)"
+            return text
+
+        return await asyncio.to_thread(_sync_read)
 
     read_file_tool = Tool(
         name="read_local_file",

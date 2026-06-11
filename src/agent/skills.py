@@ -89,7 +89,12 @@ class SkillStore:
         for child in sorted(self.dir.iterdir()) if self.dir.exists() else []:
             if not child.is_dir():
                 continue
-            skill = self._load_one(child)
+            try:
+                skill = self._load_one(child)
+            except Exception as e:
+                # 一个坏文件（非 UTF-8 / 无权限）不能拖垮全部 skill 工具
+                logger.warning("skill.load_failed dir=%s err=%s", child.name, e)
+                continue
             if skill is not None:
                 skills.append(skill)
         return skills

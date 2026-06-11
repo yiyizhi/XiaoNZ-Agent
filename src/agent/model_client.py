@@ -12,6 +12,7 @@ gateway/proxy).
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Any
 
@@ -76,8 +77,17 @@ class ModelClient:
         # read_timeout becomes a per-chunk inactivity threshold instead
         # of a wall-clock cap on the whole response. We still return a
         # final Message object so callers see the same shape as before.
-        async with self._client.messages.stream(**kwargs) as stream:
-            response = await stream.get_final_message()
+        #
+        # turn_timeout 是整轮墙钟兜底：上游持续滴流 keepalive 时
+        # read_timeout 永远不触发，没有这层整个 turn 会无限挂起、
+        # 占着 session 锁堵死后续消息（SDK 重试也包在这层里面）。
+        async def _run() -> Message:
+            async with self._client.messages.stream(**kwargs) as stream:
+                return await stream.get_final_message()
+
+        response = await asyncio.wait_for(
+            _run(), timeout=self.settings.model.turn_timeout
+        )
 
         usage = getattr(response, "usage", None)
         if usage is not None:

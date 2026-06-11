@@ -9,12 +9,12 @@ feishu:
   # not require these, but they're checked if your app has them set).
   verification_token: ""
   encrypt_key: ""
-  # Sender allowlist (STRONGLY recommended). Only messages from these
-  # open_ids are processed, in both p2p and group chats. Empty list =
-  # everyone — anyone who can DM the bot or share a group with it can
-  # then drive run_command on this machine. Find your open_id in
-  # agent.log: `feishu.recv chat_type=p2p peer=ou_...` (p2p peer = your
-  # open_id), or from a rejected sender's `feishu.sender_rejected` line.
+  # Sender allowlist (REQUIRED — fail-closed). Only messages from these
+  # open_ids are processed, in both p2p and group chats. An EMPTY list
+  # rejects everyone (the bot can run shell commands on this machine,
+  # so there is no "allow all" mode). To find an open_id: send the bot
+  # a message and copy it from the `feishu.sender_rejected` line in
+  # agent.log.
   allowed_open_ids: []
   #  - "ou_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
 
@@ -28,9 +28,14 @@ model:
   max_tokens: 8192
   # httpx timeouts. Tight by design — past incidents had the agent freeze
   # for hours after long timeouts on flaky upstreams.
+  # read_timeout is a PER-CHUNK inactivity threshold under streaming;
+  # turn_timeout is the wall-clock cap for one whole LLM call (covers
+  # upstreams that drip keepalives forever). Raise read_timeout if your
+  # gateway has long first-byte stalls.
   connect_timeout: 10.0
   read_timeout: 60.0
-  max_retries: 1
+  turn_timeout: 600.0
+  max_retries: 2
   # Optional: OpenAI-compatible path on the same gateway for image
   # generation. Leave empty/unset to disable the generate_image tool.
   openai_auth_token: ""

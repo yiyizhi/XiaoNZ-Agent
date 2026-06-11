@@ -86,7 +86,9 @@ def _friendly_error_text(exc: BaseException) -> str:
     # Lazy import: anthropic types aren't worth a top-level import here.
     from anthropic import APIConnectionError, APIStatusError, APITimeoutError, RateLimitError
 
-    if isinstance(exc, APITimeoutError) or isinstance(exc, httpx.TimeoutException):
+    if isinstance(
+        exc, (APITimeoutError, httpx.TimeoutException, asyncio.TimeoutError)
+    ):
         return "网关响应慢了点没接住，麻烦再发一遍～"
     if isinstance(exc, RateLimitError):
         return "模型限流了，等一会再试。"
@@ -415,6 +417,9 @@ class FeishuClient:
         # KeepAlive 直接拉新进程。
         self._process_start_ts = time.time()
         self._lark_connected_times: list[float] = []
+        # 最近一次收到任何 lark 事件（消息/撤回，含被白名单拦下的）的时刻。
+        # 软僵尸检测用：ws 自称 connected 但事件长时间为零 → 可疑。
+        self._last_event_ts = 0.0
         self._lark_lock = threading.Lock()
         # 注册日志过滤器：lark sdk 每次 ws 连接成功打 "Lark connected ..."
         # 抓住这条日志做 ws 健康度信号
@@ -468,7 +473,14 @@ class FeishuClient:
         FLAP_WINDOW = 90         # 90s 内
         FLAP_COUNT = 3           # ≥3 次 Lark connected → ws flapping
         ALIVE_LOG_INTERVAL = 300  # 5min: 比 heartbeat.sh 阈值 600s 小一半，确保活进程不会被误杀
+        # 软僵尸嫌疑阈值：ws 自称 connected 但连续这么久零事件（含被
+        # 白名单拦下的）就停写 alive 日志——agent.log 的 mtime 随之停更，
+        # 600s 后外部 heartbeat.sh 用 bootout+bootstrap 完整重载（2026-05-12
+        # 实测软僵尸只有这种重载救得回，进程内自杀 + KeepAlive 不行）。
+        # 代价：真空闲超过 4h 也会被重载一次，无在途 turn 时用户无感。
+        EVENT_QUIET_SEC = 4 * 3600
         last_alive_log = 0.0
+        suspect_warned = False
         while True:
             time.sleep(60)
             try:
@@ -476,14 +488,42 @@ class FeishuClient:
                 age = now - self._process_start_ts
 
                 if now - last_alive_log >= ALIVE_LOG_INTERVAL:
-                    logger.info("xiaonz.alive age=%.0fs", age)
-                    last_alive_log = now
+                    quiet = now - max(self._last_event_ts, self._process_start_ts)
+                    if quiet < EVENT_QUIET_SEC:
+                        suspect_warned = False
+                        logger.info("xiaonz.alive age=%.0fs", age)
+                        last_alive_log = now
+                        # 顺手清理 24h 前的去重记录，防 processed_events 无界增长
+                        try:
+                            self.store.prune_old_events()
+                        except Exception:
+                            logger.exception("xiaonz.watchdog.prune_failed")
+                    elif not suspect_warned:
+                        # 只警告一次然后彻底闭嘴：警告本身也会刷新 mtime，
+                        # 持续打日志会让 heartbeat.sh 永远不触发。
+                        suspect_warned = True
+                        logger.warning(
+                            "xiaonz.watchdog.alive_suppressed quiet=%.0fs — "
+                            "事件链路长时间静默，停写 alive 移交 heartbeat.sh 重载",
+                            quiet,
+                        )
 
                 if age > MAX_AGE_SEC:
-                    logger.warning(
-                        "xiaonz.watchdog.preemptive_restart age=%.0fs", age
-                    )
-                    os._exit(2)
+                    # 8h 重启如果砸在进行中的 turn 上，事件已被 dedup 标记、
+                    # 飞书重投会被丢弃，用户那条消息就永远没回复了。
+                    # 有在途 turn 就推迟，最多宽限 30 分钟。
+                    with self._inflight_lock:
+                        busy = len(self._inflight)
+                    if busy and age < MAX_AGE_SEC + 1800:
+                        logger.info(
+                            "xiaonz.watchdog.preemptive_restart_deferred "
+                            "inflight=%d age=%.0fs", busy, age,
+                        )
+                    else:
+                        logger.warning(
+                            "xiaonz.watchdog.preemptive_restart age=%.0fs", age
+                        )
+                        os._exit(2)
 
                 with self._lark_lock:
                     recent = [t for t in self._lark_connected_times
@@ -533,6 +573,7 @@ class FeishuClient:
         We dispatch the async work onto the agent thread and return
         immediately so the lark loop keeps pumping ping/pong.
         """
+        self._last_event_ts = time.time()
         try:
             msg = event.event.message
             sender = event.event.sender
@@ -559,8 +600,10 @@ class FeishuClient:
                 getattr(getattr(sender, "sender_id", None), "open_id", None)
                 or ""
             )
+            # Fail-closed：白名单为空时拒绝所有人（这个 bot 能跑本机
+            # shell，调试时把名单注释掉不该等于把机器敞开）。
             allowed = self.settings.feishu.allowed_open_ids
-            if allowed and sender_open_id not in allowed:
+            if sender_open_id not in allowed:
                 logger.warning(
                     "feishu.sender_rejected open_id=%s chat_id=%s msg_id=%s",
                     sender_open_id, msg.chat_id, msg.message_id,
@@ -697,6 +740,7 @@ class FeishuClient:
         We dedupe by event_id (so lark retries don't double-cancel)
         then cancel the inflight task for that message_id, if any.
         """
+        self._last_event_ts = time.time()
         try:
             event_id = getattr(event.header, "event_id", None)
             if event_id and self.store.is_event_processed(event_id):
@@ -768,33 +812,35 @@ class FeishuClient:
             #    handing off to the agent. Either mutates `user_text`
             #    (for files, inlined as code fence) or produces an
             #    Anthropic image content block.
-            attachments: list[dict] = []
-            if file_key:
-                user_text = await self._resolve_file(
-                    loop, message_id, session_id, file_key,
-                    file_name or "file", user_text,
-                )
-            if image_key:
-                block = await self._resolve_image(loop, message_id, image_key)
-                if block is not None:
-                    attachments.append(block)
-                else:
-                    user_text = (
-                        f"{user_text}\n\n（图片下载失败，"
-                        f"或超过 {MAX_IMAGE_BYTES // (1024 * 1024)} MB 识图上限）"
-                    )
-
             # 3. Run the agent. This is the part that can take a while
             #    and is cancellable via task.cancel(). Serialize per
             #    session so concurrent turns (e.g. a multi-image send)
             #    don't interleave appends to the same message log and
-            #    corrupt role alternation. Attachment download above is
-            #    left outside the lock so it still parallelizes.
+            #    corrupt role alternation. 附件解析也要在锁内：放在锁外时
+            #    "发图 + 紧跟一句文字说明"的常见用法里，文字消息没有下载
+            #    步骤会抢先拿锁，模型在还没看到图的情况下先回答了说明文字，
+            #    历史顺序也和发送顺序相反。
             turn_lock = self._session_turn_locks.get(session_id)
             if turn_lock is None:
                 turn_lock = asyncio.Lock()
                 self._session_turn_locks[session_id] = turn_lock
             async with turn_lock:
+                attachments: list[dict] = []
+                if file_key:
+                    user_text = await self._resolve_file(
+                        loop, message_id, session_id, file_key,
+                        file_name or "file", user_text,
+                    )
+                if image_key:
+                    block = await self._resolve_image(loop, message_id, image_key)
+                    if block is not None:
+                        attachments.append(block)
+                    else:
+                        user_text = (
+                            f"{user_text}\n\n（图片下载失败，"
+                            f"或超过 {MAX_IMAGE_BYTES // (1024 * 1024)} MB 识图上限）"
+                        )
+
                 reply = await self.agent.handle_user_message(
                     session_id=session_id,
                     source=source,
@@ -1001,15 +1047,18 @@ class FeishuClient:
         if data is None:
             return f"{user_text}\n\n（附件 {file_name} 下载失败）"
 
-        saved_path = self._save_attachment(session_id, file_name, data)
+        saved_path = await loop.run_in_executor(
+            None, self._save_attachment, session_id, file_name, data
+        )
         location_line = (
             f"\n（原件已保存到 `{saved_path}`，需要完整内容可调 "
             f"`anything_to_md` / `read_pdf` / `read_local_file`）"
             if saved_path else ""
         )
 
-        # Try text decoding first
-        decoded = _decode_text_file(data)
+        # Try text decoding first（解码/PDF 解析是同步 CPU 活，挪到
+        # executor，别堵 agent loop）
+        decoded = await loop.run_in_executor(None, _decode_text_file, data)
         if decoded is not None:
             lang = Path(file_name).suffix.lstrip(".").lower()
             fence = f"```{lang}\n{decoded}\n```" if lang else f"```\n{decoded}\n```"
@@ -1019,7 +1068,7 @@ class FeishuClient:
 
         # Try PDF extraction
         if file_name.lower().endswith(".pdf") or data[:5] == b"%PDF-":
-            pdf_text = _extract_pdf_text(data)
+            pdf_text = await loop.run_in_executor(None, _extract_pdf_text, data)
             if pdf_text:
                 return (
                     f"{user_text}\n\n# 附件：{file_name}{location_line}"

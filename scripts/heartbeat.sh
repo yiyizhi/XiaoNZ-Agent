@@ -27,6 +27,19 @@ if [ ! -f "$LOG" ]; then
     exit 0
 fi
 
+# 产物目录清理：生成的图和浏览器截图只增不删，保留 30 天。
+find "$PROJECT_ROOT/data/generated" "$PROJECT_ROOT/data/browser_captures" \
+    -type f -mtime +30 -delete 2>/dev/null
+
+# 日志轮转兜底：launchd 是 append 模式且没有 newsyslog 配置，超过 50MB
+# 截断保留尾部 5MB（崩溃循环狂刷日志时防止无界增长）。
+MAX_LOG_BYTES=$((50 * 1024 * 1024))
+LOG_SIZE=$(stat -f %z "$LOG" 2>/dev/null || echo 0)
+if [ "$LOG_SIZE" -gt "$MAX_LOG_BYTES" ]; then
+    tail -c $((5 * 1024 * 1024)) "$LOG" > "$LOG.tmp" && cat "$LOG.tmp" > "$LOG" && rm -f "$LOG.tmp"
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] rotated agent.log size=${LOG_SIZE}" >> "$HEARTBEAT_LOG"
+fi
+
 NOW=$(date +%s)
 MTIME=$(stat -f %m "$LOG" 2>/dev/null)
 if [ -z "$MTIME" ]; then
